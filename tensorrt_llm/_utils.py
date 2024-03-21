@@ -21,6 +21,7 @@ import weakref
 from functools import partial
 from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
+from tensorrt_llm.logger import logger
 
 import numpy as np
 import yaml
@@ -30,6 +31,9 @@ from packaging import version
 import torch
 import tensorrt as trt
 # isort: on
+
+import os
+KOMPRESS_ENVIRON_DATASET_JSON_PATH = "KOMPRESS_ENVIRON_DATASET_JSON_PATH"
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -424,3 +428,50 @@ def set_obj_attrs(
         assert not hasattr(
             obj, key), (f"Overwriting existing tensor attribute: {key}")
         setattr(obj, key, value)
+
+
+def get_data_from_kompress():
+    """This method loads the Kompress dataset for quantisation use."""
+
+    kompress_dataset_json_path = os.environ.get(KOMPRESS_ENVIRON_DATASET_JSON_PATH, None)
+    kompress_dataset_json_path = Path(kompress_dataset_json_path) if kompress_dataset_json_path else None
+
+    if not kompress_dataset_json_path:
+        logger.warning(f"Could not load Kompress dataset. Env var `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` not set.")
+        return None
+    
+    from dataclasses import dataclass, field
+    from datasets import load_dataset, load_from_disk
+    @dataclass
+    class Dataset:
+        # adapted from Kompress
+
+        dataset_name_or_path: Optional[str] = field(default=None, metadata={
+            "help": "Name of the dataset."})
+        dataset_subset: Optional[str] = field(default=None, metadata={
+            "help": "Name of the dataset subset."})
+        text_column: Optional[str] = field(default="text", metadata={
+            "help": "Name of the text column(s). If multiple columns, separate by comma."})
+        split: Optional[str] = field(default="train", metadata={
+            "help": "Split of the dataset."})
+        format_string: Optional[str] = field(default=None, metadata={
+            "help": "Format of the dataset."})
+
+        new_text_column = "text"
+
+        @classmethod
+        def from_json_file(cls, filepath: Path):
+            import json
+            with open(filepath, 'r') as file:
+                json_dict = json.load(file)
+            return cls(**json_dict)
+    
+        def load_caliberation_data(self):
+            ds = load_from_disk(self.dataset_name_or_path)
+            return ds[self.split][self.text_column]
+    
+    dataset_obj = Dataset.from_json_file(kompress_dataset_json_path)
+
+    return dataset_obj
+
+    

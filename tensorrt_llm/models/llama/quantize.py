@@ -25,33 +25,26 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ..._utils import str_dtype_to_torch
+from ..._utils import str_dtype_to_torch, get_data_from_kompress
 from ...logger import logger
 from ...models.quantized.ammo import quantize_and_export
 
 
-def get_calib_dataloader(data="cnn_dailymail",
-                         tokenizer=None,
-                         batch_size=1,
-                         calib_size=512,
-                         block_size=512,
-                         cache_dir=None):
-    print("Loading calibration dataset")
-    if data == "pileval":
-        dataset = load_dataset(
-            "json",
-            data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
-            split="train",
-            cache_dir=cache_dir)
-        dataset = dataset["text"][:calib_size]
-    elif data == "cnn_dailymail":
-        dataset = load_dataset("cnn_dailymail",
-                               name="3.0.0",
-                               split="train",
-                               cache_dir=cache_dir)
-        dataset = dataset["article"][:calib_size]
+def get_calib_dataloader(
+        tokenizer=None,
+        batch_size=1,
+        calib_size=512,
+        block_size=512,
+        cache_dir=None
+    ):
+    kompress_dataset = get_data_from_kompress()
+    if not kompress_dataset:
+        logger.warning("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
+        dataset = load_dataset("ccdv/cnn_dailymail",
+                            '3.0.0',
+                            cache_dir=cache_dir)
     else:
-        raise NotImplementedError
+        dataset = kompress_dataset.load_caliberation_data()
 
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",
