@@ -28,6 +28,8 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from tensorrt_llm._utils import get_data_from_kompress
+from tensorrt_llm.logger import logger
 
 EMPTY_CFG = {
     "quant_cfg": {
@@ -185,18 +187,12 @@ def get_calib_dataloader(data="cnn_dailymail",
                          calib_size=512,
                          block_size=512,
                          device=None):
-    print("Loading calibration dataset")
-    if data == "pileval":
-        dataset = load_dataset(
-            "json",
-            data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
-            split="train")
-        dataset = dataset["text"][:calib_size]
-    elif data == "cnn_dailymail":
-        dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
-        dataset = dataset["article"][:calib_size]
+    kompress_dataset = get_data_from_kompress()
+    if not kompress_dataset:
+        logger.warning("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
+        dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
     else:
-        raise NotImplementedError
+        dataset = kompress_dataset.load_caliberation_data()
 
     batch_encoded = tokenizer.batch_encode_plus(dataset,
                                                 return_tensors="pt",
