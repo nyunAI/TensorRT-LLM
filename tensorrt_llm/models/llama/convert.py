@@ -17,13 +17,15 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm._utils import pad_vocab_size
+from tensorrt_llm._utils import pad_vocab_size, get_data_from_kompress
 
 from ...layers import MoeConfig
 from ...lora_manager import LoraConfig
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig
 from .weight import load_from_hf_checkpoint
+
+from tensorrt_llm.logger import logger
 
 try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
@@ -344,11 +346,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
-        line[0] = line[0] + ' TL;DR: '
-        line[0] = line[0].strip()
-        line[0] = line[0].replace(" n't", "n't")
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         input_ids = tokenizer(line,
                               return_tensors="pt",
                               max_length=seq_len,
@@ -1018,9 +1017,15 @@ def smooth_quant(model,
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
-    dataset = load_dataset("ccdv/cnn_dailymail",
-                           '3.0.0',
-                           cache_dir=dataset_cache_dir)
+
+    kompress_dataset = get_data_from_kompress()
+    if not kompress_dataset:
+        logger.warning("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
+        dataset = load_dataset("ccdv/cnn_dailymail",
+                            '3.0.0',
+                            cache_dir=dataset_cache_dir)
+    else:
+        dataset = kompress_dataset.load_caliberation_data()
 
     act_range = capture_activation_range(
         model,
@@ -1213,7 +1218,7 @@ def quantize(dtype,
              lora_target_modules=None,
              max_lora_rank=None):
     '''
-        Quantize the save the model as TRT-LLM checkpoint to output_dir
+        Quantize then save the model as TRT-LLM checkpoint to output_dir
     '''
     #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling ammo
     kwargs = {
