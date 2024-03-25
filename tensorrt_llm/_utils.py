@@ -21,7 +21,7 @@ import weakref
 from functools import partial
 from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
-from tensorrt_llm.logger import logger
+from .logger import logger
 
 import numpy as np
 import yaml
@@ -437,7 +437,7 @@ def get_data_from_kompress():
     kompress_dataset_json_path = Path(kompress_dataset_json_path) if kompress_dataset_json_path else None
 
     if not kompress_dataset_json_path:
-        logger.warning(f"Could not load Kompress dataset. Env var `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` not set.")
+        logger.info(f"Could not load Kompress dataset. Env var `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` not found.")
         return None
     
     from dataclasses import dataclass, field
@@ -471,7 +471,7 @@ def get_data_from_kompress():
             return ds[self.split][self.text_column]
     
     dataset_obj = Dataset.from_json_file(kompress_dataset_json_path)
-
+    logger.info(f"Loading Kompress dataset from `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` ...")
     return dataset_obj
 
     

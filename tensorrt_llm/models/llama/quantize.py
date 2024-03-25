@@ -39,12 +39,13 @@ def get_calib_dataloader(
     ):
     kompress_dataset = get_data_from_kompress()
     if not kompress_dataset:
-        logger.warning("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
+        logger.info("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
         dataset = load_dataset("ccdv/cnn_dailymail",
                             '3.0.0',
                             cache_dir=cache_dir)
     else:
         dataset = kompress_dataset.load_caliberation_data()
+        logger.info(f"✅ Loading Kompress dataset complete.")
 
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",

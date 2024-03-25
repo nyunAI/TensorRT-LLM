@@ -25,7 +25,7 @@ from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig
 from .weight import load_from_hf_checkpoint
 
-from tensorrt_llm.logger import logger
+from ...logger import logger
 
 try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
@@ -1020,12 +1020,13 @@ def smooth_quant(model,
 
     kompress_dataset = get_data_from_kompress()
     if not kompress_dataset:
-        logger.warning("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
+        logger.info("Could not load Kompress dataset for quantisation. Using default ccdv/cnn_dailymail 3.0.0")
         dataset = load_dataset("ccdv/cnn_dailymail",
                             '3.0.0',
                             cache_dir=dataset_cache_dir)
     else:
         dataset = kompress_dataset.load_caliberation_data()
+        logger.info(f"✅ Loading Kompress dataset complete.")
 
     act_range = capture_activation_range(
         model,

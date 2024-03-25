@@ -55,8 +55,7 @@ class Logger(metaclass=Singleton):
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         logging.basicConfig(level=severity_map[min_severity][1],
-                            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-                            datefmt="%m/%d/%Y %H-%M-%S",
+                            format="%(name)s - %(message)s",
                             stream=sys.stdout)
         self._logger = logging.getLogger('TRT-LLM')
         self._polygraphy_logger = G_LOGGER
@@ -88,7 +87,7 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, msg):
-        msg = f'[TRT-LLM] {severity} ' + msg
+        msg = f'[TRT-LLM] ' + msg
         self._func_wrapper(severity)(msg)
 
     def critical(self, msg):
