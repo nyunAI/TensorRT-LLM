@@ -36,8 +36,8 @@ def parse_arguments():
     parser.add_argument("--ckpt-type",
                         type=str,
                         choices=["jax", "keras", "torch", "hf"])
-    parser.add_argument("--model-dir", type=pathlib.Path, required=True)
-    parser.add_argument("--output-model-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--model_dir", type=pathlib.Path, required=True)
+    parser.add_argument("--output_model_dir", type=pathlib.Path, required=True)
     parser.add_argument("--world-size",
                         type=int,
                         default=1,
