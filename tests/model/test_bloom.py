@@ -59,10 +59,9 @@ class TestBloom(unittest.TestCase):
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_bloom,
                                   bloom_config, batch_size, input_len,
-                                  output_len, fp16, gpt_attention_plugin,
+                                  output_len, dtype, gpt_attention_plugin,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
-        dtype = 'float16' if fp16 else 'float32'
         config = {
             'architecture': 'BloomForCausalLM',
             'dtype': dtype,
@@ -95,6 +94,7 @@ class TestBloom(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=1)
             # Prepare
@@ -123,7 +123,6 @@ class TestBloom(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -132,21 +131,21 @@ class TestBloom(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             network.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
 
             self._gen_tensorrt_llm_network(network, builder, hf_bloom,
                                            bloom_config, batch_size, input_len,
-                                           output_len, fp16, use_plugin,
+                                           output_len, dtype, use_plugin,
                                            world_size,
                                            apply_query_key_layer_scaling)
 
@@ -224,6 +223,12 @@ class TestBloom(unittest.TestCase):
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         cache_indirections = [
             torch.full((
                 batch_size,
@@ -261,6 +266,7 @@ class TestBloom(unittest.TestCase):
             if enable_remove_input_padding:
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
+            ctx_buffer['host_runtime_perf_knobs'] = context_runtime_perf_knobs
         else:
             ctx_buffer['attention_mask'] = ctx_attention_mask
 
@@ -462,10 +468,14 @@ class TestBloom(unittest.TestCase):
         context_lengths = torch.ones(
             (batch_size)).type(torch.int32).cuda() * seq_len
 
-        decoder.setup(batch_size,
-                      max_context_length=seq_len,
-                      max_new_tokens=max_new_tokens,
-                      beam_width=num_beams)
+        enable_bloom_context_fmha_fp32_acc = context_fmha_type == ContextFMHAType.enabled_with_fp32_acc
+
+        decoder.setup(
+            batch_size,
+            max_context_length=seq_len,
+            max_new_tokens=max_new_tokens,
+            beam_width=num_beams,
+            enable_context_fmha_fp32_acc=enable_bloom_context_fmha_fp32_acc)
 
         output_ids = decoder.decode(input_ids, context_lengths, sampling_config)
         # TODO: change to actual ragged tensor after BLOOM plugin supports it

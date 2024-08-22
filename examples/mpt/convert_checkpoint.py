@@ -13,7 +13,6 @@ import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           MptForCausalLM)
@@ -21,6 +20,8 @@ from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import load_calib_dataset
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -67,6 +68,13 @@ def parse_arguments():
         'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
         'Note: the flag might not take effect when the criteria are not met.')
 
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument(
         "--calibrate_kv_cache",
         "-kv",
@@ -329,8 +337,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -639,6 +647,7 @@ def get_tllm_param(
 
 
 def convert_hf_mpt_legacy(hf_model,
+                          hf_config,
                           mapping,
                           rank=0,
                           dtype='float32',
@@ -971,23 +980,23 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = "W8A16"
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = "W4A16"
+        quant_algo = QuantAlgo.W4A16
 
     if args.smoothquant:
         if args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif not args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
         elif not args.per_token and args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif args.per_token and not args.per_channel:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
 
     if args.calibrate_kv_cache:
-        kv_cache_quant_algo = "INT8"
+        kv_cache_quant_algo = QuantAlgo.INT8
     else:
         kv_cache_quant_algo = None
 
@@ -1038,13 +1047,12 @@ if __name__ == '__main__':
     # smoother for inputs of self_attn.o_proj and mlp.down_proj
     mpt_smoother = {}
     if args.smoothquant is not None or args.calibrate_kv_cache:
-        dataset = load_dataset("ccdv/cnn_dailymail",
-                               '3.0.0',
-                               cache_dir=args.dataset_cache_dir)
-        act_range = capture_activation_range(
-            hf_model,
-            AutoTokenizer.from_pretrained(args.model_dir, padding_side='left'),
-            dataset)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
+                                                  padding_side='left')
+        dataset = load_calib_dataset(args.calib_dataset,
+                                     cache_dir=args.dataset_cache_dir)
+
+        act_range = capture_activation_range(hf_model, tokenizer, dataset)
         if args.smoothquant is not None:
             smooth_mpt_model(hf_model, act_range, args.smoothquant,
                              mpt_qkv_para, mpt_smoother)
@@ -1058,6 +1066,7 @@ if __name__ == '__main__':
         if args.smoothquant is not None or args.calibrate_kv_cache:
             weights = convert_hf_mpt_legacy(
                 hf_model,
+                hf_config,
                 mapping,
                 rank,
                 dtype=args.dtype,

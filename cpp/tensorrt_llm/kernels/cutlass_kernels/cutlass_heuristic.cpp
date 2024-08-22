@@ -24,6 +24,7 @@
 
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/numeric_types.h"
+#include "tensorrt_llm/common/assert.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
@@ -65,12 +66,13 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config)
     case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64: return TileShape{128, 128};
     case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64: return TileShape{128, 256};
     case CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64: return TileShape{256, 128};
-    default: throw std::runtime_error("[TensorRT-LLm Error][get_grid_shape_for_config] Invalid config");
+    case CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128: return TileShape{16, 256};
+    default: TLLM_THROW("[get_grid_shape_for_config] Invalid config");
     }
 }
 
-bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, const TileShape tile_shape,
-    int const split_k_factor, const size_t workspace_bytes, bool const is_weight_only)
+bool is_valid_split_k_factor(int64_t const m, int64_t const n, int64_t const k, TileShape const tile_shape,
+    int const split_k_factor, size_t const workspace_bytes, bool const is_weight_only)
 {
 
     // All tile sizes have a k_tile of 64.
@@ -110,28 +112,33 @@ bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, 
 }
 
 std::vector<CutlassTileConfig> get_candidate_tiles(
-    int const sm, bool const is_weight_only, bool const simt_configs_only, bool const int8_configs_only)
+    int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
     enum class CutlassGemmType : char
     {
         Default,
         WeightOnly,
         Simt,
-        Int8
+        Int8,
+        Fp8
     };
 
     CutlassGemmType gemm_type = CutlassGemmType::Default;
-    if (simt_configs_only)
+    if (config_type_param & CutlassGemmConfig::SIMT_ONLY)
     {
         gemm_type = CutlassGemmType::Simt;
     }
-    else if (is_weight_only)
+    else if (config_type_param & CutlassGemmConfig::WEIGHT_ONLY)
     {
         gemm_type = CutlassGemmType::WeightOnly;
     }
-    else if (int8_configs_only)
+    else if (config_type_param & CutlassGemmConfig::INT8_ONLY)
     {
         gemm_type = CutlassGemmType::Int8;
+    }
+    else if (config_type_param & CutlassGemmConfig::FP8_ONLY)
+    {
+        gemm_type = CutlassGemmType::Fp8;
     }
 
     std::vector<CutlassTileConfig> base_configs{
@@ -165,74 +172,88 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
             CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
             CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
             CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+    case CutlassGemmType::Fp8:
+        if (config_type_param & CutlassGemmConfig::GROUPED_GEMM)
+        {
+            if (sm == 89)
+            {
+                return {CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128,
+                    CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                    CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+                    CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+            }
+            else
+            {
+                // no valid ampere style fp8 configs for sm90
+                return {};
+            }
+        }
     default: return base_configs;
     }
 }
 
 std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
-    int const sm, bool const is_weight_only, bool const simt_configs_only, bool const int8_configs_only)
+    int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config)
 {
-    enum class CutlassGemmType : char
+#ifdef FAST_BUILD
+    // Fast build disables all configs except this one for SM90
+    return {CutlassTileConfigSM90::CtaShape128x128x128B};
+#else
+    if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
-        Default,
-        WeightOnly,
-        Simt,
-        Int8
-    };
-
-    CutlassGemmType gemm_type = CutlassGemmType::Default;
-    if (simt_configs_only)
-    {
-        gemm_type = CutlassGemmType::Simt;
+        return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
+            CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
+            CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
     }
-    else if (is_weight_only)
+    else
     {
-        gemm_type = CutlassGemmType::WeightOnly;
-    }
-    else if (int8_configs_only)
-    {
-        gemm_type = CutlassGemmType::Int8;
-    }
-
-    switch (gemm_type)
-    {
-    case CutlassGemmType::WeightOnly:
         return {CutlassTileConfigSM90::CtaShape64x16x128B, CutlassTileConfigSM90::CtaShape64x32x128B,
             CutlassTileConfigSM90::CtaShape64x64x128B, CutlassTileConfigSM90::CtaShape64x128x128B,
             CutlassTileConfigSM90::CtaShape64x256x128B, CutlassTileConfigSM90::CtaShape128x16x128B,
             CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
             CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
-    default: throw std::runtime_error("get_candidate_tiles_sm90 only supports WeightOnly now.");
     }
+#endif
 }
 
 // We only compile CUTLASS kernels with multi-cast along M if the M tile is >= 128. This is purely to improve
 // compilation speed.
-bool supports_mcast_along_m(const CutlassTileConfigSM90 tile)
+bool supports_mcast_along_m(CutlassTileConfigSM90 const tile)
 {
+#ifdef FAST_BUILD
+    return false;
+#else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape128x16x128B,
         CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
-        CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
+        CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B,
+        CutlassTileConfigSM90::CtaShape256x128x128B};
     return valid_tiles.count(tile) == 1;
+#endif
 }
 
 // We only compile CUTLASS kernels with multi-cast along N if the N tile is >= 128. This is purely to improve
 // compilation speed.
-bool supports_mcast_along_n(const CutlassTileConfigSM90 tile)
+bool supports_mcast_along_n(CutlassTileConfigSM90 const tile)
 {
+#ifdef FAST_BUILD
+    return false;
+#else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape64x128x128B,
         CutlassTileConfigSM90::CtaShape64x256x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
-        CutlassTileConfigSM90::CtaShape128x256x128B};
+        CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
     return valid_tiles.count(tile) == 1;
+#endif
 }
 
-std::vector<CutlassGemmConfig> get_candidate_configs(int sm, bool const is_weight_only, bool const simt_configs_only,
-    bool const int8_configs_only, int const max_split_k, bool const enable_hopper_gmma)
+std::vector<CutlassGemmConfig> get_candidate_configs(
+    int sm, int const max_split_k, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
-    if (sm == 90 && enable_hopper_gmma)
+    if (sm == 90 && (config_type_param & CutlassGemmConfig::HOPPER))
     {
-        std::vector<CutlassTileConfigSM90> tiles
-            = get_candidate_tiles_sm90(sm, is_weight_only, simt_configs_only, int8_configs_only);
+        std::vector<CutlassTileConfigSM90> tiles = get_candidate_tiles_sm90(sm, config_type_param);
 
         std::vector<CutlassGemmConfig> candidate_configs;
         for (auto const& tile_config : tiles)
@@ -266,10 +287,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs(int sm, bool const is_weigh
         }
         return candidate_configs;
     }
-    std::vector<CutlassTileConfig> tiles
-        = get_candidate_tiles(sm, is_weight_only, simt_configs_only, int8_configs_only);
+    std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
 
     std::vector<CutlassGemmConfig> candidate_configs;
+    bool const int8_configs_only = config_type_param & CutlassGemmConfig::INT8_ONLY;
     int const min_stages = int8_configs_only ? 3 : 2;
     int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
     for (auto const& tile_config : tiles)
@@ -293,14 +314,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs(int sm, bool const is_weigh
 }
 
 CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmConfig> const& candidate_configs,
-    std::vector<int> const& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
-    int const split_k_limit, const size_t workspace_bytes, int const multi_processor_count, int const is_weight_only)
+    std::vector<int> const& occupancies, int64_t const m, int64_t const n, int64_t const k, int64_t const num_experts,
+    int const split_k_limit, size_t const workspace_bytes, int const multi_processor_count, int const is_weight_only)
 {
 
     if (occupancies.size() != candidate_configs.size())
     {
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][estimate_best_config_from_occupancies] occpancies and "
+        TLLM_THROW(
+            "[estimate_best_config_from_occupancies] occpancies and "
             "candidate configs vectors must have equal length.");
     }
 
@@ -374,7 +395,7 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
 
     if (best_config.tile_config == CutlassTileConfig::ChooseWithHeuristic)
     {
-        throw std::runtime_error("[TensorRT-LLm Error] Heurisitc failed to find a valid config.");
+        TLLM_THROW("Heurisitc failed to find a valid config.");
     }
 
     return best_config;

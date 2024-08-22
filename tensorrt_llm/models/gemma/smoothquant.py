@@ -1,21 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import functools
 import math
 import time
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import Cache, LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       LlamaDecoderLayer,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
+
+from tensorrt_llm._utils import pad_vocab_size, torch_to_numpy
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.gemma.weight import dup_kv_weight
+
+if TYPE_CHECKING:
+    from transformers import AutoModelForCausalLM, Cache
+
+    # transformers included  ⬆️ `Cache` in https://github.com/huggingface/transformers/commit/633215ba58fe5114d8c8d32e415a04600e010701 - transformers 4.33, which is installed in the tests, is before this.
 
 
 def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
@@ -44,13 +67,14 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     """
 
     # compute weight scaling factors for fp->int8 and int8->fp
+    fp32_weight = weights.to(torch.float32).cpu()
     if is_qkv and not multi_query_mode:
         scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
             dim=-1, keepdims=True)[0].cpu().numpy()
         scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
                                                              -1).cpu().numpy()
     elif is_qkv and multi_query_mode:
-        hidden_dim = weights.shape[0]
+        hidden_dim = fp32_weight.shape[0]
         local_dim = act_range["w"].shape[0]
         kv_dim = (local_dim - hidden_dim) // 2
         scale_w_q = act_range["w"][0:hidden_dim]
@@ -101,16 +125,16 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
             np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
         ])
 
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
+    to_i8 = lambda x: torch_to_numpy(x.round().clip(-127, 127).to(torch.int8))
 
     if is_qkv and multi_query_mode:
-        weight_int8 = to_i8(weights / scale_w_quant_orig_t)
+        weight_int8 = to_i8(fp32_weight / scale_w_quant_orig_t)
     else:
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t)
+        weight_int8 = to_i8(fp32_weight * scale_w_orig_quant_t)
 
     return {
         "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
+        "weight.int8.col": to_i8(fp32_weight * scale_w_orig_quant_c),
         "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
         "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
         "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
@@ -148,7 +172,7 @@ def smooth_gemm(gemm_weights,
                 act_scales,
                 layernorm_weights=None,
                 layernorm_bias=None,
-                alpha=0.5,
+                alpha: Optional[float] = 0.5,
                 weight_scales=None):
     if not isinstance(gemm_weights, list):
         gemm_weights = [gemm_weights]
@@ -179,7 +203,7 @@ def capture_activation_range(model,
                              dataset,
                              num_samples=1,
                              seq_len=512):
-    model.eval()
+    model.cuda().eval()
     device = next(model.parameters()).device
     act_scales = defaultdict(lambda: {"x": None, "y": None, "w": None})
 
@@ -214,8 +238,8 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset['train'][i:i + 1]
-        line = copy.copy(datapoint['article'])
+        datapoint = dataset[i:i + 1]
+        line = copy.copy(datapoint)
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
@@ -241,7 +265,7 @@ def smooth_gemm_fc1_gate(fc1_weights,
                          act_scales,
                          layernorm_weights=None,
                          layernorm_bias=None,
-                         alpha=0.5,
+                         alpha: Optional[float] = 0.5,
                          weight_scales=None):
     gemm_weights = []
     if not isinstance(fc1_weights, list):
@@ -275,7 +299,8 @@ def smooth_gemm_fc1_gate(fc1_weights,
 
 
 @torch.no_grad()
-def smooth_model(model, scales, alpha, qkv_para, smoother_dict):
+def smooth_model(model, scales, alpha: Optional[float], qkv_para,
+                 smoother_dict):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         if not isinstance(module, LlamaDecoderLayer):
@@ -592,7 +617,7 @@ class LlamaAttentionExtend(LlamaAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: "Optional[Cache]" = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -737,11 +762,7 @@ def create_model_from_config(trt_llm_config, weights):
         'vocab_embedding': 'embed_tokens',
     }
     for name in list(weights):
-        if model_config.dtype == "bfloat16":
-            param = torch.from_numpy(weights[name].astype(np.float32)).to(
-                torch.bfloat16)
-        else:
-            param = torch.from_numpy(weights[name])
+        param = weights[name]
         weights.pop(name)
         new_name = name.replace('transformer', 'model')
         for _name in replace_name_dict:
@@ -759,25 +780,21 @@ def create_model_from_config(trt_llm_config, weights):
             weights[new_name.replace('attention.qkv', 'self_attn.v_proj')] = vw
         else:
             weights[new_name] = param
+
+    if "lm_head.weight" not in weights:
+        weights["lm_head.weight"] = weights["model.embed_tokens.weight"].clone()
     model.load_state_dict(weights)
     return model
 
 
-def convert_hf_model(hf_model,
-                     mapping,
-                     vocab_size=32000,
-                     dtype='float32',
-                     use_parallel_embedding=False,
-                     sharding_dim=0,
-                     use_weight_only=False,
-                     plugin_weight_only_quant_type=torch.int8,
-                     use_smooth_quant=False,
-                     per_channel=False,
-                     per_token=False,
-                     int8_kv_cache=False,
-                     act_range=[],
-                     qkv_para=[],
-                     smoother=[]):
+def convert_hf_model(*, hf_model: "AutoModelForCausalLM", mapping: Mapping,
+                     vocab_size: int, dtype: str, use_parallel_embedding: bool,
+                     sharding_dim: int, use_weight_only: bool,
+                     plugin_weight_only_quant_type: torch.dtype,
+                     use_smooth_quant: bool, per_channel: bool, per_token: bool,
+                     int8_kv_cache: bool,
+                     act_range: "defaultdict[Any, dict[str, None]]",
+                     qkv_para: Dict, smoother: Dict):
 
     weights = {}
     tik = time.time()
@@ -813,7 +830,7 @@ def convert_hf_model(hf_model,
                 qkv_weight = qkv_weight.reshape(hidden_size, 3,
                                                 head_size * num_attention_heads)
 
-            int8_weights = generate_int8(qkv_weight.numpy(),
+            int8_weights = generate_int8(qkv_weight,
                                          act_range.get(prefix +
                                                        'self_attn.qkv_proj'),
                                          is_qkv=True,
@@ -887,7 +904,7 @@ def convert_hf_model(hf_model,
         attn_dense_weight = get_weight(model_params,
                                        prefix + 'self_attn.o_proj', dtype)
         if use_smooth_quant:
-            attn_dense_weight = attn_dense_weight.t().numpy()
+            attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
                 attn_dense_weight, act_range.get(prefix + 'self_attn.o_proj'))
             weights.update(
@@ -919,7 +936,7 @@ def convert_hf_model(hf_model,
         # MLP hf up to trt gate
         mlp_up_weight = get_weight(model_params, prefix + 'mlp.up_proj', dtype)
         if use_smooth_quant:
-            mlp_up_weight = mlp_up_weight.t().numpy()
+            mlp_up_weight = mlp_up_weight.t()
             int8_weights = generate_int8(mlp_up_weight,
                                          act_range.get(prefix + 'mlp.up_proj'))
             weights.update(
@@ -950,7 +967,7 @@ def convert_hf_model(hf_model,
         mlp_gate_weight = get_weight(model_params, prefix + 'mlp.gate_proj',
                                      dtype)
         if use_smooth_quant:
-            mlp_gate_weight = mlp_gate_weight.t().numpy()
+            mlp_gate_weight = mlp_gate_weight.t()
             int8_weights = generate_int8(
                 mlp_gate_weight, act_range.get(prefix + 'mlp.gate_proj'))
             weights.update(
@@ -981,7 +998,7 @@ def convert_hf_model(hf_model,
         mlp_proj_weight = get_weight(model_params, prefix + 'mlp.down_proj',
                                      dtype)
         if use_smooth_quant:
-            mlp_proj_weight = mlp_proj_weight.t().numpy()
+            mlp_proj_weight = mlp_proj_weight.t()
             int8_weights = generate_int8(
                 mlp_proj_weight, act_range.get(prefix + 'mlp.down_proj'))
             weights.update(

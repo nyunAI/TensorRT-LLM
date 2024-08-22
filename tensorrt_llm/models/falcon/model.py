@@ -12,19 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional, Union
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, allreduce, recv, send
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              QuantConfig, check_share_embedding)
+from .config import FalconConfig
+from .convert import load_weights_from_hf_by_shard, load_weights_from_hf_model
 
 
 class FalconDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: FalconConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -61,7 +65,7 @@ class FalconDecoderLayer(Module):
             tp_rank=tp_rank,
             bias=config.bias,
             position_embedding_type=config.position_embedding_type,
-            quant_mode=config.quant_mode,
+            quant_mode=config.quantization.quant_mode,
         )
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -81,7 +85,7 @@ class FalconDecoderLayer(Module):
             bias=config.bias,
             tp_group=tp_group,
             tp_size=tp_size,
-            quant_mode=config.quant_mode,
+            quant_mode=config.quantization.quant_mode,
         )
         if self.is_parallel_attention:
             self.post_layernorm = None
@@ -142,23 +146,13 @@ class FalconDecoderLayer(Module):
 
 class FalconModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: FalconConfig):
         super().__init__()
         self.config = config
         if config.mapping.is_first_pp_rank():
-            if config.use_parallel_embedding:
-                self.vocab_embedding = Embedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                    dtype=config.dtype,
-                    tp_group=config.mapping.tp_group,
-                    tp_size=config.mapping.tp_size,
-                    sharding_dim=config.embedding_sharding_dim,
-                    tp_rank=config.mapping.tp_rank)
-            else:
-                self.vocab_embedding = Embedding(config.vocab_size,
-                                                 config.hidden_size,
-                                                 dtype=config.dtype)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
         self.layers = DecoderLayerList(FalconDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
@@ -173,9 +167,6 @@ class FalconModel(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None):
-        if use_cache:
-            presents = []
-
         if self.config.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
         else:
@@ -203,25 +194,22 @@ class FalconModel(Module):
 
 
 class FalconForCausalLM(DecoderModelForCausalLM):
+    config_class = FalconConfig
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: FalconConfig):
         self.check_config(config)
         transformer = FalconModel(config)
-        vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                           config.mapping.tp_size)
-        if config.mapping.is_last_pp_rank():
-            share_weight = None
-            if config.share_embedding_table:
-                share_weight = transformer.vocab_embedding.weight
 
+        if config.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                               config.mapping.tp_size)
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,
                                    bias=False,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=True,
-                                   share_weight=share_weight)
+                                   gather_output=True)
         else:
             lm_head = None
         super().__init__(config, transformer, lm_head)
@@ -230,3 +218,52 @@ class FalconForCausalLM(DecoderModelForCausalLM):
         config.set_if_not_exist('bias', True)
         config.set_if_not_exist('new_decoder_architecture', False)
         config.set_if_not_exist('parallel_attention', False)
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a FalconForCausalLM object from give parameters
+        '''
+        import transformers
+
+        load_by_shard = kwargs.pop('load_by_shard', False)
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = FalconConfig.from_hugging_face(hf_config_or_dir,
+                                                dtype=dtype,
+                                                mapping=mapping,
+                                                quant_config=quant_config,
+                                                **kwargs)
+
+        if use_preloading:
+            assert not load_by_shard
+            weights = load_weights_from_hf_model(hf_model, config)
+        elif load_by_shard:
+            weights = load_weights_from_hf_by_shard(hf_model_dir, config)
+        else:
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(
+                hf_model_dir,
+                trust_remote_code=True,
+                torch_dtype='auto',
+                device_map='auto' if not load_model_on_cpu else 'cpu')
+            weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model

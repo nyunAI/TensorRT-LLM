@@ -15,6 +15,7 @@
 import collections
 import contextlib
 import hashlib
+import inspect
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -131,6 +132,7 @@ class Network(object):
 
         from .graph_rewriting import FLayerInfoMemo
         self.flayer_memo = FLayerInfoMemo()  # holds the functional metadata
+        self._parameter_tensors = {}  # holds the parameter tensors
 
     def _init(self, trt_network):
         self._trt_network = trt_network
@@ -163,6 +165,17 @@ class Network(object):
                 np.copyto(weights, values, casting='no')
             else:
                 Parameter.xavier_init(weights)
+
+    @property
+    def parameter_tensors(self):
+        return self._parameter_tensors
+
+    def get_parameter_tensor(self, param):
+        return self.parameter_tensors.get(param, None)
+
+    def set_parameter_tensor(self, param, tensor):
+        assert param not in self.parameter_tensors
+        self.parameter_tensors[param] = tensor
 
     @property
     def dtype(self) -> trt.DataType:
@@ -208,6 +221,7 @@ class Network(object):
             shape=shape,
             dtype=dtype,
         )
+        assert tensor.trt_tensor is not None, f"Couldn't create TRT tensor for {name} {dtype} {shape}"
         if dim_range is not None:
             logger.debug(
                 f'Add input: {name}, shape: {shape}, dtype: {dtype}, dimension names:{list(dim_range.keys())}'
@@ -222,12 +236,12 @@ class Network(object):
         from .functional import cast
 
         # In strongly_typed, if tensor output is not the same, add a cast
-        if self.strongly_typed:
+        if dtype is not None and self.strongly_typed:
             tensor = cast(tensor, dtype)
         self.trt_network.mark_output(tensor.trt_tensor)
         tensor.trt_tensor.name = name
         if not self.strongly_typed:
-            tensor.trt_tensor.dtype = dtype
+            tensor.trt_tensor.dtype = dtype or tensor.trt_tensor.dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
     def set_named_parameters(self, named_parameters):
@@ -241,6 +255,22 @@ class Network(object):
         original_layer_name = layer.name
         layer_name = str(layer.type).split('.')[-1]
         current_module = self._module_call_stack.get_current_module()
+
+        func_stack = []
+        frame = inspect.currentframe().f_back.f_back
+        while frame:
+            func_name = frame.f_code.co_name
+            line_num = frame.f_lineno
+            if func_name == "forward":
+                break
+            func_stack.insert(0, f"{func_name}_L{line_num}")
+            if len(func_stack) >= 10:
+                # NOTE: TRT error messages has a character limit.
+                #       Limiting to only 10 levels helps retain
+                #       the true error message from TRT.
+                break
+            frame = frame.f_back
+        current_module = f"{current_module}.{'.'.join(func_stack)}"
 
         if layer.type == trt.LayerType.PLUGIN_V2:
             layer_name = '_'.join(
@@ -265,6 +295,9 @@ class Network(object):
                 if plugin_info is not None:
                     set_plugin_info(self.trt_network, layer.name, plugin_info)
                     delete_plugin_info(self.trt_network, original_layer_name)
+
+        # Set layer metadata to the same as the layer name so that it can show up in NVTX.
+        layer.metadata = layer.name
 
     def register_ndarray(self, ndarray: np.ndarray) -> None:
         ''' When the functional APIs need to create local numpy array and use as weights for constant or other layers,
@@ -427,8 +460,10 @@ class Network(object):
             )
             return
 
-        dot = graphviz.Digraph(comment='TensorRT Graph',
-                               format=format if format != 'text' else None)
+        dot = graphviz.Digraph(
+            comment=
+            f'TensorRT Graph of {self._get_network_hash(lightweight=False)}',
+            format=format if format != 'text' else None)
 
         inputs_names = set([x.name for x in self.get_inputs()])
         output_names = set([x.name for x in self.get_outputs()])
@@ -469,10 +504,12 @@ class Network(object):
 
             return tensor_to_alias[tensor]
 
-        def create_tensor_node(tensor: str):
+        def create_tensor_node(tensor: str, dtype=None, shape=None):
             tensor_alias = get_alias(tensor, tensor_id)
             if tensor_alias not in nodes:
-                dot.node(tensor_alias, tensor_alias, **node_style)
+                dot.node(tensor_alias,
+                         str(dtype) + "\n" + tensor_alias + "\n" + str(shape),
+                         **node_style)
                 nodes.add(tensor_alias)
             return tensor_alias
 
@@ -482,18 +519,20 @@ class Network(object):
                 nodes.add(layer)
 
         for tensor, layer in state.tensor_to_producer.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             create_layer_node(layer.name)
             dot.edge(layer.name, tensor_alias)
         for tensor, layers in state.tensor_to_consumers.items():
-            tensor_alias = create_tensor_node(tensor.name)
+            tensor_alias = create_tensor_node(tensor.name, tensor.dtype,
+                                              tensor.shape)
             for layer in layers:
                 create_layer_node(layer.name)
                 dot.edge(tensor_alias, layer.name)
 
         if format == "text":
             return dot.source
-        dot.render(path)
+        dot.save(path)
 
     def _get_graph(self) -> "Network._GraphState":
         '''

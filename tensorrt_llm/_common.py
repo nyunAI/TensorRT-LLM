@@ -19,15 +19,23 @@ import platform
 import time
 from functools import wraps
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 # isort: off
 import torch
 import tensorrt as trt
+
 # isort: on
 
+if TYPE_CHECKING:
+    from .network import Network
+else:
+    Network = None
+
 from ._utils import str_dtype_to_trt
+from .bindings import MpiComm
 from .logger import logger
 from .plugin import _load_plugin_lib
 
@@ -49,6 +57,8 @@ def _init(log_level: object = None) -> None:
         logger.info('Skipping TensorRT-LLM init.')
         return
 
+    logger.info('Starting TensorRT-LLM init.')
+
     # load plugin lib
     _load_plugin_lib()
 
@@ -64,10 +74,12 @@ def _init(log_level: object = None) -> None:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
 
+    MpiComm.local_init()
+
     logger.info('TensorRT-LLM inited.')
 
 
-def default_net():
+def default_net() -> Network:
     assert net, "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
     return net
 
@@ -194,42 +206,66 @@ def _is_building(f):
     return decorated
 
 
-def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
+def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
+                         max_input_len, max_seq_len, max_beam_width,
                          remove_input_padding, enable_context_fmha,
-                         tokens_per_block):
+                         tokens_per_block, multiple_profiles):
     if not remove_input_padding:
-        if max_num_tokens is not None:
+        if max_num_tokens is not None or opt_num_tokens is not None:
+            max_num_tokens = max_batch_size * max_seq_len
             logger.warning("remove_input_padding is not enabled, the specified "
-                           "max_num_tokens will be ignored.")
-        return max_num_tokens
-    elif remove_input_padding and max_num_tokens is None:
-        max_num_tokens = max_input_len * max_batch_size
-        logger.warning(
-            "remove_input_padding is enabled, while max_num_tokens "
-            "is not set, setting to max_batch_size*max_input_len. \n"
-            "It may not be optimal to set max_num_tokens=max_batch_size*max_input_len "
-            "when remove_input_padding is enabled, because the number "
-            "of packed input tokens are very likely to be smaller, "
-            "we strongly recommend to set max_num_tokens according "
-            "to your workloads.")
-    if max_num_tokens > max_input_len * max_batch_size:
-        max_num_tokens = max_input_len * max_batch_size
+                           "max_num_tokens/opt_num_tokens will be ignored.")
+        return max_num_tokens, opt_num_tokens
+    else:
+        if max_num_tokens is None:
+            max_num_tokens = max_seq_len * max_batch_size
+            logger.warning(
+                "remove_input_padding is enabled, while max_num_tokens "
+                "is not set, setting to max_batch_size*max_seq_len. \n"
+                "It may not be optimal to set max_num_tokens=max_batch_size*max_seq_len "
+                "when remove_input_padding is enabled, because the number "
+                "of packed input tokens are very likely to be smaller, "
+                "we strongly recommend to set max_num_tokens according "
+                "to your workloads.")
+        if opt_num_tokens is None and not multiple_profiles:
+            opt_num_tokens = min(max_batch_size * max_beam_width,
+                                 max_num_tokens)
+            logger.warning(
+                "remove_input_padding is enabled, while opt_num_tokens "
+                "is not set, setting to max_batch_size*max_beam_width. \n")
+        if max_num_tokens > 16384:
+            logger.warning(
+                "Specifying a `max_num_tokens` larger than 16384 is usually "
+                "not recommended, we do not expect perf gain with that and too "
+                "large `max_num_tokens` could possibly exceed the TensorRT "
+                "tensor volume, causing runtime errors. "
+                f"Got `max_num_tokens` = {max_num_tokens}")
+    if max_num_tokens > max_seq_len * max_batch_size:
+        max_num_tokens = max_seq_len * max_batch_size
         logger.warning(
             f"max_num_tokens ({max_num_tokens}) shouldn't be greater than "
-            f"max_input_len * max_batch_size ({max_input_len * max_batch_size}), "
-            f"specifying to max_input_len * max_batch_size ({max_input_len * max_batch_size})."
+            f"max_seq_len * max_batch_size ({max_seq_len * max_batch_size}), "
+            f"specifying to max_seq_len * max_batch_size ({max_seq_len * max_batch_size})."
         )
     if max_num_tokens < max_input_len and not enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is not turned on, max_num_tokens ({max_num_tokens}) "
-            f"should be greater than max_input_len ({max_input_len}), specifying to "
+            f"should be at least max_input_len ({max_input_len}), specifying to "
             f"max_input_len ({max_input_len}).")
         max_num_tokens = max_input_len
     elif max_num_tokens < tokens_per_block and enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is turned on, max_num_tokens ({max_num_tokens}) "
-            f"should be greater than tokens_per_block ({tokens_per_block}), specifying to "
+            f"should be at least tokens_per_block ({tokens_per_block}), specifying to "
             f"tokens_per_block ({tokens_per_block}). At this time, you also need to enable "
             f"context chunking at runtime, otherwise you may encounter errors.")
         max_num_tokens = tokens_per_block
-    return max_num_tokens
+
+    if opt_num_tokens is not None and opt_num_tokens > max_num_tokens:
+        logger.warning(
+            f"opt_num_tokens ({opt_num_tokens}) shouldn't be greater than "
+            f"max_num_tokens ({max_num_tokens}), "
+            f"specifying to max_num_tokens ({max_num_tokens}).")
+        opt_num_tokens = max_num_tokens
+
+    return max_num_tokens, opt_num_tokens

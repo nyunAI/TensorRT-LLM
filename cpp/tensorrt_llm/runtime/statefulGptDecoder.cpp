@@ -36,43 +36,47 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
-    auto constexpr nvSizeType = TRTDataType<SizeType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
     auto constexpr nvFloatType = TRTDataType<float>::value;
 
     auto& dInput = mDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    mSetupBatchSlots = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), mSetupBatchSlots);
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
     auto& dOutput = mDecodingOutput;
     auto outputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds));
+    auto gatheredOutputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds), std::move(gatheredOutputIds));
 
     dOutput->newTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finished
+    dOutput->finishReasons
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    dOutput->finishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
+    dOutput->finishedSum = mBufferManager.pinnedPool(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
 
-    dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
-    dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType>::value);
+    dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
+    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    dInput->stopWordsLists.resize(1);
+    dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
+    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    dInput->badWordsLists.resize(1);
 
-    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
+    mFinishedSum = mBufferManager.pinnedPool(ITensor::makeShape({1}), nvSizeType);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
-    SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
-    bool fusedDecoder, nvinfer1::DataType dtype)
+void StatefulGptDecoder::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+    SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
@@ -83,8 +87,8 @@ void StatefulGptDecoder::setup(DecodingMode const& mode, SizeType maxBatchSize, 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
-    SizeType sinkTokenLength, SizeType maxSequenceLength)
+void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchSize > 0);
@@ -97,6 +101,9 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
 
     auto const batchSizeShape = ITensor::makeShape({batchSize});
     auto const batchSizeXbeamWidth = ITensor::makeShape({batchSize, beamWidth});
+    mSetupBatchSlots->reshape(batchSizeShape);
+    auto setupBatchSlotsRange = runtime::BufferRange<runtime::SizeType32>(*mSetupBatchSlots);
+    std::iota(setupBatchSlotsRange.begin(), setupBatchSlotsRange.end(), 0);
 
     auto& dInput = *mDecodingInput;
     const_cast<ITensor&>(*dInput.endIds).reshape(batchSizeXbeamWidth);
@@ -111,12 +118,20 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
 
     auto& dOutput = *mDecodingOutput;
     dOutput.ids->reshape(outputIdsShape);
+    if (beamWidth > 1)
+    {
+        dOutput.gatheredIds->reshape(outputIdsShape);
+    }
+    else
+    {
+        dOutput.gatheredIds = dOutput.ids;
+    }
     dOutput.newTokens->reshape(batchSizeXbeamWidth);
     mBufferManager.setZero(*dOutput.newTokens);
     dOutput.parentIds->reshape(outputIdsShape);
-    dOutput.finished->reshape(batchSizeXbeamWidth);
-    dInput.finished = ITensor::view(dOutput.finished);
-    mBufferManager.setZero(*dOutput.finished);
+    dOutput.finishReasons->reshape(batchSizeXbeamWidth);
+    dInput.finishReasons = ITensor::view(dOutput.finishReasons);
+    mBufferManager.setZero(*dOutput.finishReasons);
 
     dOutput.finishedSum->reshape(batchSizeShape);
     mBufferManager.setZero(*dOutput.finishedSum);
@@ -131,10 +146,6 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
         dOutput.cumLogProbs->reshape(batchSizeXbeamWidth);
         mBufferManager.setZero(*dOutput.cumLogProbs);
         dOutput.beamHypotheses.reshape(batchSize, beamWidth, mMaxSequenceLength);
-    }
-    else
-    {
-        dOutput.beamHypotheses.release();
     }
 
     mNbSteps = 0;
@@ -154,7 +165,7 @@ void StatefulGptDecoder::newBatch(
     auto const beamWidth = samplingConfig.beamWidth;
 
     reshapeBuffers(batchSize, beamWidth, mMaxAttentionWindow, mSinkTokenLength, mMaxSequenceLength);
-    mDecoder->setup(samplingConfig, batchSize, mMaxSequenceLength);
+    mDecoder->setup(samplingConfig, batchSize, mSetupBatchSlots);
 
     // sanity checks, should always be true after reshape
     auto const& outputIdsShape = mDecodingOutput->ids->getShape();
@@ -165,10 +176,10 @@ void StatefulGptDecoder::newBatch(
 
     auto const& inputIds = inputs.ids;
     auto const inputLengthsHost = manager.copyFrom(*inputLengths, MemoryType::kCPU);
-    auto const* inputLengthsData = bufferCast<SizeType>(*inputLengthsHost);
-    SizeType const maxInputLength = *std::max_element(inputLengthsData, inputLengthsData + inputLengths->getSize());
+    auto const* inputLengthsData = bufferCast<SizeType32>(*inputLengthsHost);
+    SizeType32 const maxInputLength = *std::max_element(inputLengthsData, inputLengthsData + inputLengths->getSize());
 
-    TensorPtr inputOffsets = manager.emptyTensor(MemoryType::kGPU, TRTDataType<SizeType>::value);
+    TensorPtr inputOffsets = manager.emptyTensor(MemoryType::kGPU, TRTDataType<SizeType32>::value);
     if (inputs.packed)
     {
         inputOffsets->reshape(ITensor::makeShape({batchSize + 1}));
@@ -185,7 +196,7 @@ void StatefulGptDecoder::newBatch(
     dInput.maxLength = maxInputLength;
     dInput.maxAttentionWindow = mMaxAttentionWindow;
     dInput.sinkTokenLength = mSinkTokenLength;
-    dInput.maxBatchSize = batchSize;
+    dInput.batchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;
 
@@ -200,23 +211,23 @@ void StatefulGptDecoder::newBatch(
         dInput.maxBadWordsLen = badWordsLen;
 
         TensorPtr badWordsList = ITensor::view(inputs.badWordsList);
-        auto badWordsLensRange = BufferRange<SizeType>(*constPointerCast(dInput.badWordsLens));
-        auto badWordsPtrsRange = BufferRange<int32_t*>(*constPointerCast(dInput.badWordsPtrs));
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        auto badWordsLensRange = BufferRange<SizeType32>(*constPointerCast(dInput.badWordsLens));
+        auto badWordsPtrsRange = BufferRange<TokenIdType*>(*constPointerCast(dInput.badWordsPtrs));
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             if (badWordsShape.nbDims == 3)
             {
-                badWordsPtrsRange[bi] = bufferCast<SizeType>(*badWordsList) + bi * 2 * badWordsLen;
+                badWordsPtrsRange[bi] = bufferCast<TokenIdType>(*badWordsList) + bi * 2 * badWordsLen;
             }
             else
             {
-                badWordsPtrsRange[bi] = bufferCast<SizeType>(*badWordsList);
+                badWordsPtrsRange[bi] = bufferCast<TokenIdType>(*badWordsList);
             }
             badWordsLensRange[bi] = badWordsLen;
         }
         // NOTE(nkorobov): dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
         // allocated
-        dInput.badWordsList = badWordsList;
+        dInput.badWordsLists.at(0) = badWordsList;
     }
     if (inputs.stopWordsList)
     {
@@ -224,16 +235,16 @@ void StatefulGptDecoder::newBatch(
         dInput.maxStopWordsLen = stopWordsLen;
 
         TensorPtr stopWordsList = ITensor::view(inputs.stopWordsList);
-        auto stopWordsPtrsRange = BufferRange<int32_t*>(*constPointerCast(dInput.stopWordsPtrs));
-        auto stopWordsLensRange = BufferRange<SizeType>(*constPointerCast(dInput.stopWordsLens));
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        auto stopWordsPtrsRange = BufferRange<TokenIdType*>(*constPointerCast(dInput.stopWordsPtrs));
+        auto stopWordsLensRange = BufferRange<SizeType32>(*constPointerCast(dInput.stopWordsLens));
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            stopWordsPtrsRange[bi] = bufferCast<SizeType>(*stopWordsList) + bi * 2 * stopWordsLen;
+            stopWordsPtrsRange[bi] = bufferCast<TokenIdType>(*stopWordsList) + bi * 2 * stopWordsLen;
             stopWordsLensRange[bi] = stopWordsLen;
         }
         // NOTE(nkorobov): dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
         // allocated
-        dInput.stopWordsList = stopWordsList;
+        dInput.stopWordsLists.at(0) = stopWordsList;
     }
 
     auto inputLengthsView = ITensor::view(dInput.lengths, ITensor::makeShape({batchSize * beamWidth}));
@@ -255,7 +266,7 @@ void StatefulGptDecoder::newBatch(
     // output
     auto& dOutput = *mDecodingOutput;
     manager.setZero(*dOutput.newTokens);
-    manager.setZero(*dOutput.finished);
+    manager.setZero(*dOutput.finishReasons);
     manager.setZero(*dOutput.finishedSum);
 
     // If outputs contains cumLogProbs, use that
@@ -275,7 +286,7 @@ void StatefulGptDecoder::newBatch(
     {
         std::vector<float> cumLogProbsHost(batchSize * beamWidth, DecodingOutput::kNegativeInfinity);
         // Set the entries for the first beam to 0
-        for (SizeType i = 0; i < batchSize; ++i)
+        for (SizeType32 i = 0; i < batchSize; ++i)
         {
             cumLogProbsHost[tc::flat_index2(i, 0, beamWidth)] = 0;
         }
@@ -315,8 +326,8 @@ void StatefulGptDecoder::forwardAsync(decoder::Output& output, decoder::Input co
     auto& tgtCacheIndirection = output.cacheIndirection;
     TLLM_CHECK_WITH_INFO((srcCacheIndirection && tgtCacheIndirection) || (!srcCacheIndirection && !tgtCacheIndirection),
         "Specify both srcCacheIndirection and tgtCacheIndirection or neither.");
-    TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
-    TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
+    TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType32>::value);
+    TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType32>::value);
 
     auto& dInput = *mDecodingInput;
     auto& dOutput = *mDecodingOutput;
@@ -344,14 +355,13 @@ void StatefulGptDecoder::forwardSync()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::finalize() const
+void StatefulGptDecoder::finalize(SamplingConfig const&) const
 {
     // TODO (rkobus) can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
-    auto finalOutputIds = mBufferManager.gpu(outputIds->getShape(), outputIds->getDataType());
-    mDecoder->gatherTree(*finalOutputIds, *mDecodingOutput, *mDecodingInput, mBufferManager);
-    mBufferManager.copy(*finalOutputIds, *outputIds);
+    mDecoder->gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager);
+    mBufferManager.copy(*(mDecodingOutput->gatheredIds), *outputIds);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return;
 }

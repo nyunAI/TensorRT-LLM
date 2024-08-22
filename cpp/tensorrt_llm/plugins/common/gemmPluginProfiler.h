@@ -16,30 +16,32 @@
  */
 #pragma once
 
+#include "pluginUtils.h"
+#include "tensorrt_llm/common/logger.h"
+
+#include <cuda_runtime.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
-
-#include <cuda_runtime.h>
-
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
 
 namespace tensorrt_llm::plugins
 {
 
 struct GemmDims
 {
-    int32_t minM;
-    int32_t maxM;
-    int32_t n;
-    int32_t k;
+    using DimType64 = utils::DimType64;
+
+    DimType64 minM;
+    DimType64 maxM;
+    DimType64 n;
+    DimType64 k;
 
     GemmDims()
         : minM(-1)
@@ -49,7 +51,7 @@ struct GemmDims
     {
     }
 
-    GemmDims(int32_t minM_, int32_t maxM_, int32_t n_, int32_t k_)
+    GemmDims(DimType64 minM_, DimType64 maxM_, DimType64 n_, DimType64 k_)
         : minM(minM_)
         , maxM(maxM_)
         , n(n_)
@@ -57,7 +59,7 @@ struct GemmDims
     {
     }
 
-    bool isInitialized() const
+    [[nodiscard]] bool isInitialized() const
     {
         return minM >= 0 && maxM >= 0 && n >= 0 && k >= 0;
     }
@@ -122,11 +124,14 @@ class GemmIdCublas : public GemmIdCore
 public:
     bool transA{};
     bool transB{};
+    nvinfer1::DataType outputDtype;
 
-    GemmIdCublas(int n_, int k_, nvinfer1::DataType const& dtype_, bool transA_, bool transB_)
+    GemmIdCublas(int n_, int k_, nvinfer1::DataType const& dtype_, bool transA_, bool transB_,
+        nvinfer1::DataType const& output_dtype_)
         : GemmIdCore(n_, k_, dtype_)
         , transA(transA_)
         , transB(transB_)
+        , outputDtype(output_dtype_)
     {
     }
 
@@ -134,7 +139,7 @@ public:
 
     bool operator==(GemmIdCublas const& id) const
     {
-        return isEqual(id) && transA == id.transA && transB == id.transB;
+        return isEqual(id) && transA == id.transA && transB == id.transB && outputDtype == id.outputDtype;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIdCublas const& id)
@@ -143,6 +148,7 @@ public:
         out << " type=" << static_cast<int>(id.dtype);
         out << " transA=" << id.transA;
         out << " transB=" << id.transB;
+        out << " outputDtype=" << static_cast<int>(id.outputDtype);
         return out;
     }
 };
@@ -157,7 +163,8 @@ struct GemmIdCublasHash
         auto h3 = std::hash<int>{}(static_cast<int>(id.dtype));
         auto h4 = std::hash<bool>{}(id.transA);
         auto h5 = std::hash<bool>{}(id.transB);
-        return h1 ^ h2 ^ h3 ^ h4 ^ h5;
+        auto h6 = std::hash<bool>{}(static_cast<int>(id.outputDtype));
+        return h1 ^ h2 ^ h3 ^ h4 ^ h5 ^ h6;
     }
 };
 
@@ -165,8 +172,6 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 class GemmPluginProfiler
 {
 public:
-    static constexpr int MAX_PROFILE_M = 8192;
-
     // Map for single GEMM for different Ms (GEMM dimension) to the best config for particular M
     using MProfileMap = std::unordered_map<int, std::optional<Config>>;
     using MProfileMapPtr = std::shared_ptr<MProfileMap>;
@@ -202,7 +207,7 @@ public:
             {
                 std::ostringstream msg;
                 msg << "Cannot find ID (" << id << ") in the profile map. Abort.";
-                TLLM_LOG_ERROR(msg.str());
+                TLLM_THROW(msg.str());
             }
             return iter->second;
         }
@@ -237,10 +242,12 @@ public:
 
     std::optional<Config> getBestConfig(int m, GemmIdType const& gemmId) const;
 
+    virtual int getMaxProfileM() const;
+
 protected:
     virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
 
-    virtual void computeTmpSize(int maxM, int n, int k) = 0;
+    virtual void computeTmpSize(size_t maxM, size_t n, size_t k) = 0;
 
     virtual bool checkTactic(int m, int n, int k, Config const& tactic) const
     {
@@ -249,7 +256,7 @@ protected:
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
 
-    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream);
 
 private:
     void allocateTmpData();
@@ -282,6 +289,8 @@ private:
     size_t mTmpWorkspaceSizeInBytes{0};
 
     char* mWorkspaceTmp{nullptr};
+
+    cudaStream_t mStream;
 
     GemmDims mDims{};
 

@@ -2,6 +2,23 @@
 
 This document shows how to build and run a Baichuan models (including `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b`) in TensorRT-LLM on both single GPU and single node multi-GPU.
 
+## Table of Contents
+
+- [Baichuan](#baichuan)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Groupwise quantization (AWQ/GPTQ)](#groupwise-quantization-awqgptq)
+        - [AWQ](#awq)
+        - [GPTQ](#gptq)
+      - [INT8 KV cache](#int8-kv-cache)
+    - [Run](#run)
+    - [Summarization using the Baichuan model](#summarization-using-the-baichuan-model)
+
 ## Overview
 
 The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/baichuan`](./). There is one main file:
@@ -30,6 +47,12 @@ The TensorRT-LLM Baichuan example code locates at [examples/baichuan](./). It ta
 
 ### Build TensorRT engine(s)
 
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
 Need to specify the HF Baichuan checkpoint path. For `v1_13b`, you should use whether [baichuan-inc/Baichuan-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan-13B-Chat) or [baichuan-inc/Baichuan-13B-Base](https://huggingface.co/baichuan-inc/Baichuan-13B-Base). For `v2_13b`, you should use whether [baichuan-inc/Baichuan2-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat) or [baichuan-inc/Baichuan2-13B-Base](https://huggingface.co/baichuan-inc/Baichuan2-13B-Base). More Baichuan models could be found on [baichuan-inc](https://huggingface.co/baichuan-inc).
 
 TensorRT-LLM Baichuan builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
@@ -49,7 +72,7 @@ trtllm-build --checkpoint_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1024 \
-             --max_output_len=512
+             --max_seq_len=1536
 ```
 
 
@@ -76,6 +99,7 @@ python convert_checkpoint.py --model_version v1_13b \
                              --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/int8_weight_only/1-gpu/
 
 # Convert the Baichuan V1 13B model using a single GPU and apply INT4 weight-only quantization.
+# Note that Baichuan V1 7B performs not well when using INT4 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
@@ -88,7 +112,6 @@ python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
-                             --world_size 2 \
                              --tp_size 2
 ```
 
@@ -114,9 +137,9 @@ python convert_checkpoint.py --model_version v1_13b \
 
 #### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO(version>=0.7.0) toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
 # Quantize HF Baichuan v2 13B into FP8 and export a single-rank checkpoint
@@ -128,10 +151,11 @@ python ../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
 ```
 
 The quantized model checkpoint is saved to `./quantized_fp8/` for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 #### Groupwise quantization (AWQ/GPTQ)
 ##### AWQ
-NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+NVIDIA Modelopt toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for Modelopt installation instructions.
 ```bash
 # Quantize HF Baichuan 13B checkpoint into INT4 AWQ format
 python ../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
@@ -162,7 +186,6 @@ To run the GPTQ Baichuan example, the following steps are required:
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --group_size 64 \
-                                 --world_size 2 \
                                  --tp_size 2 \
                                  --output_dir ./tmp/baichuan_v2_13b/trt_ckpts/int4_gptq_gs64/2-gpu/
     ```
@@ -171,7 +194,7 @@ To run the GPTQ Baichuan example, the following steps are required:
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through NVIDIA AMMO (AlgorithMic Model Optimization) toolkit, which features a
+You can get the INT8 scale of KV cache through NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit, which features a
 `--kv_cache_dtype` option.
 
 Example:
@@ -193,7 +216,7 @@ python ../quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
                                    --qformat int4_wo \
                                    --kv_cache_dtype int8 \
                                    --output_dir ./trt_ckpt/baichuan_int4wo_int8kv_tp1 \
-                                   --calib_size 512
+                                   --calib_size 512 \
 ```
 
 **INT8 KV cache + AWQ**

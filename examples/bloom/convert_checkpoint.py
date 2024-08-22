@@ -19,8 +19,8 @@ from transformers.pytorch_utils import Conv1D
 # isort: off
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.models.llama.utils import iterate_shard_files, load_state_dict  #TODO: move the utils to common dir shared by models
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
+from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, load_calib_dataset
 # isort: on
 
 
@@ -116,7 +116,7 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        input_ids = tokenizer(dataset[i]["text"],
+        input_ids = tokenizer(dataset[i],
                               return_tensors="pt",
                               max_length=seq_len,
                               truncation=True).input_ids.to(device)
@@ -215,6 +215,13 @@ def parse_arguments():
                         type=Path,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='lambada',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument(
         "--smoothquant",
         "-sq",
@@ -1046,23 +1053,23 @@ def main():
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
         if args.per_channel and args.per_token:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
         elif args.per_channel and not args.per_token:
-            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN
         elif not args.per_channel and args.per_token:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
         else:
-            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+            quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
 
     kv_cache_quant_algo = None
     if args.int8_kv_cache:
-        kv_cache_quant_algo = 'INT8'
+        kv_cache_quant_algo = QuantAlgo.INT8
 
     hf_config = BloomConfig.from_pretrained(args.model_dir)
     config = {
@@ -1114,11 +1121,10 @@ def main():
     if args.smoothquant is not None or args.int8_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
-        from datasets import load_dataset
-        dataset = load_dataset("lambada", split="validation", cache_dir=None)
-        act_range = capture_activation_range(
-            hf_bloom, BloomTokenizerFast.from_pretrained(args.model_dir),
-            dataset)
+        tokenizer = BloomTokenizerFast.from_pretrained(args.model_dir)
+        dataset = load_calib_dataset(args.calib_dataset)
+
+        act_range = capture_activation_range(hf_bloom, tokenizer, dataset)
         if args.smoothquant is not None:
             smooth_bloom_model(hf_bloom, act_range, args.smoothquant,
                                bloom_qkv_param, bloom_smoother)

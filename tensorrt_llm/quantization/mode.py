@@ -13,23 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from enum import IntFlag, auto
+from typing import Optional
 
-W8A16 = 'W8A16'
-W4A16 = 'W4A16'
-W4A16_AWQ = 'W4A16_AWQ'
-W4A8_AWQ = 'W4A8_AWQ'
-W4A16_GPTQ = 'W4A16_GPTQ'
-W8A8_SQ_PER_CHANNEL = 'W8A8_SQ_PER_CHANNEL'
-W8A8_SQ_PER_TENSOR_PLUGIN = 'W8A8_SQ_PER_TENSOR_PLUGIN'
-W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'  # nosec B105
-W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'  # nosec B105
-W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'  # nosec B105
-FP8 = 'FP8'
-INT8 = 'INT8'
+from strenum import StrEnum
+
+from .._utils import BaseEnumMeta
+
+
+class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
+    W8A16 = auto()
+    W4A16 = auto()
+    W4A16_AWQ = auto()
+    W4A8_AWQ = auto()
+    W4A16_GPTQ = auto()
+    W8A8_SQ_PER_CHANNEL = auto()
+    W8A8_SQ_PER_TENSOR_PLUGIN = auto()
+    W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN = auto()
+    W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN = auto()
+    W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN = auto()
+    FP8 = auto()
+    FP8_PER_CHANNEL_PER_TOKEN = auto()
+    INT8 = auto()
+
+
+QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
+KV_CACHE_QUANT_ALGO_LIST = [QuantAlgo.FP8, QuantAlgo.INT8]
 W8A8_SQ_PLUGIN_LIST = [
-    W8A8_SQ_PER_TENSOR_PLUGIN, W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
-    W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN, W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
+    QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN,
+    QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
+    QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN,
+    QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN,
 ]
+MODELOPT_FLOW_QUANTIZATIONS = {
+    QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
+    QuantAlgo.W4A8_AWQ
+}
 
 
 class QuantMode(IntFlag):
@@ -53,6 +71,8 @@ class QuantMode(IntFlag):
     FP8_KV_CACHE = auto()
     # FP8 QDQ
     FP8_QDQ = auto()
+    # FP8 rowwise
+    FP8_ROWWISE = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -94,7 +114,8 @@ class QuantMode(IntFlag):
         return self._any(self.PER_TOKEN)
 
     def has_act_static_scaling(self):
-        return not self.has_per_token_dynamic_scaling()
+        return not self.has_per_token_dynamic_scaling(
+        ) and not self.has_fp8_rowwise()
 
     def has_per_channel_scaling(self):
         return self._any(self.PER_CHANNEL)
@@ -114,11 +135,14 @@ class QuantMode(IntFlag):
     def has_fp8_qdq(self):
         return self._any(self.FP8_QDQ)
 
+    def has_fp8_rowwise(self):
+        return self._any(self.FP8_ROWWISE)
+
     def has_any_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
                          | self.ACTIVATIONS
                          | self.INT8_KV_CACHE | self.FP8_KV_CACHE
-                         | self.FP8_QDQ)
+                         | self.FP8_QDQ | self.FP8_ROWWISE)
 
     def set_int8_kv_cache(self):
         return self | self.INT8_KV_CACHE
@@ -129,6 +153,9 @@ class QuantMode(IntFlag):
     def set_fp8_qdq(self):
         return self | self.FP8_QDQ
 
+    def set_fp8_rowwise(self):
+        return self | self.FP8_ROWWISE | self.PER_TOKEN | self.PER_CHANNEL
+
     @staticmethod
     def from_description(quantize_weights=False,
                          quantize_activations=False,
@@ -138,7 +165,8 @@ class QuantMode(IntFlag):
                          use_int4_weights=False,
                          use_int8_kv_cache=False,
                          use_fp8_kv_cache=False,
-                         use_fp8_qdq=False):
+                         use_fp8_qdq=False,
+                         use_fp8_rowwise=False):
 
         def raise_error():
             raise ValueError(f"Unsupported combination of QuantMode args: "
@@ -150,7 +178,8 @@ class QuantMode(IntFlag):
                              f"{use_int4_weights=}"
                              f"{use_int8_kv_cache=}"
                              f"{use_fp8_kv_cache=}"
-                             f"{use_fp8_qdq=}")
+                             f"{use_fp8_qdq=}"
+                             f"{use_fp8_rowwise=}")
 
         # We must quantize weights when we quantize activations.
         if quantize_activations and not quantize_weights:
@@ -192,6 +221,9 @@ class QuantMode(IntFlag):
         if use_fp8_qdq:
             mode = mode | QuantMode.FP8_QDQ
 
+        if use_fp8_rowwise:
+            mode = mode | QuantMode.FP8_ROWWISE | QuantMode.PER_TOKEN | QuantMode.PER_CHANNEL
+
         return mode
 
     @staticmethod
@@ -208,43 +240,50 @@ class QuantMode(IntFlag):
                                           use_int4_weights=use_int4_weights)
 
     @staticmethod
-    def from_quant_algo(quant_algo, kv_cache_quant_algo=None):
-        if quant_algo == W8A16:
+    def from_quant_algo(
+        quant_algo: Optional[QuantAlgo],
+        kv_cache_quant_algo: Optional[QuantAlgo] = None,
+    ) -> "QuantMode":
+        assert quant_algo is None or quant_algo in QUANT_ALGO_LIST
+        assert kv_cache_quant_algo is None or kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST
+        if quant_algo == QuantAlgo.W8A16:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=False)
-        elif quant_algo == W4A16:
+        elif quant_algo == QuantAlgo.W4A16:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True)
-        elif quant_algo == W4A16_AWQ:
+        elif quant_algo == QuantAlgo.W4A16_AWQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == W4A8_AWQ:
+        elif quant_algo == QuantAlgo.W4A8_AWQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == W4A16_GPTQ:
+        elif quant_algo == QuantAlgo.W4A16_GPTQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
                                                    per_group=True)
-        elif quant_algo == W8A8_SQ_PER_CHANNEL:
+        elif quant_algo == QuantAlgo.W8A8_SQ_PER_CHANNEL:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=True)
-        elif quant_algo == W8A8_SQ_PER_TENSOR_PLUGIN:
+        elif quant_algo == QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=False)
-        elif quant_algo == W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN:
+        elif quant_algo == QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=True,
                                                     per_channel=True)
-        elif quant_algo == W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN:
+        elif quant_algo == QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,
                                                     per_channel=True)
-        elif quant_algo == W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN:
+        elif quant_algo == QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN:
             quant_mode = QuantMode.use_smooth_quant(per_token=True,
                                                     per_channel=False)
-        elif quant_algo == FP8:
+        elif quant_algo == QuantAlgo.FP8:
             quant_mode = QuantMode.from_description(use_fp8_qdq=True)
+        elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            quant_mode = QuantMode.from_description(use_fp8_rowwise=True)
         else:
             quant_mode = QuantMode(0)
 
-        if kv_cache_quant_algo == INT8:
+        if kv_cache_quant_algo == QuantAlgo.INT8:
             quant_mode = quant_mode.set_int8_kv_cache()
-        elif kv_cache_quant_algo == FP8:
+        elif kv_cache_quant_algo == QuantAlgo.FP8:
             quant_mode = quant_mode.set_fp8_kv_cache()
 
         return quant_mode
@@ -263,6 +302,8 @@ class QuantMode(IntFlag):
             self.has_int8_kv_cache(),
             'enable_fp8':
             self.has_fp8_qdq(),
+            'enable_fp8_rowwise':
+            self.has_fp8_rowwise(),
             'fp8_kv_cache':
             self.has_fp8_kv_cache(),
             'use_weight_only':

@@ -40,21 +40,26 @@ from ._common import _init, default_net, default_trtnet, precision
 # but may be called in dependencies (such as examples)
 from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
-from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt
+from ._utils import (mpi_rank, mpi_world_size, str_dtype_to_trt,
+                     torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
-from .builder import Builder, BuilderConfig
+from .builder import BuildConfig, Builder, BuilderConfig, build
 from .functional import Tensor, constant
-from .hlapi.llm import LLM, ModelConfig
+from .hlapi.llm import LLM, LlmArgs, SamplingParams
 from .logger import logger
 from .mapping import Mapping
+from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
 from .parameter import Parameter
 from .version import __version__
 
 __all__ = [
+    'AutoConfig',
+    'AutoModelForCausalLM',
     'logger',
     'str_dtype_to_trt',
+    'torch_dtype_to_trt',
     'str_dtype_to_torch'
     'mpi_barrier',
     'mpi_rank',
@@ -68,6 +73,8 @@ __all__ = [
     'Mapping',
     'Builder',
     'BuilderConfig',
+    'build',
+    'BuildConfig',
     'Tensor',
     'Parameter',
     'runtime',
@@ -79,7 +86,9 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
-    'ModelConfig',
+    'LlmArgs',
+    'SamplingParams',
+    'KvCacheConfig',
     '__version__',
 ]
 

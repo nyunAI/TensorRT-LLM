@@ -19,6 +19,7 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/pipeline>
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -27,6 +28,13 @@
 #endif
 
 #include "selectiveScan.h"
+
+#include "selectiveScan/CudaType.h"
+#include "selectiveScan/bmmchunk.h"
+#include "selectiveScan/chunkcumsum.h"
+#include "selectiveScan/chunkscan.h"
+#include "selectiveScan/chunkstate.h"
+#include "selectiveScan/statepassing.h"
 
 namespace tensorrt_llm
 {
@@ -65,6 +73,8 @@ __device__ void convertAndStore(__nv_bfloat16* output, float input)
 }
 #endif
 
+#pragma nv_diag_suppress static_var_with_dynamic_init
+
 template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, int STAGES = 12,
     int SEQ_UNROLL = 6>
 __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBase params)
@@ -74,17 +84,13 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
     bool dt_softplus = params.delta_softplus;
-    int num_tokens = params.seqlen;
     int num_channels = params.dim;
-
-    // static const int STAGES = 12;
-    // static const int SEQ_UNROLL = 6;
 
     __shared__ cuda::pipeline_shared_state<cuda::thread_scope::thread_scope_block, STAGES / SEQ_UNROLL> pipeline_state;
     auto block = cooperative_groups::this_thread_block();
@@ -96,26 +102,33 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
     __shared__ input_t sh_x[STAGES][CHANNELS_PER_BLOCK];
     __shared__ input_t sh_z[STAGES][CHANNELS_PER_BLOCK];
 
-    __shared__ weight_t sh_D[CHANNELS_PER_BLOCK];
-    __shared__ weight_t sh_dt_bias[CHANNELS_PER_BLOCK];
-
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     int const sample = blockIdx.y; // batch id
 
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const bc_cols = DSTATE * 2 + params.dt_rank;
+    int const b_offset = params.dt_rank;
+    int const c_offset = params.dt_rank + DSTATE;
+
+    int num_tokens;
+    int start_token_idx;
+    if (params.remove_padding)
+    {
+        start_token_idx = sample == 0 ? 0 : params.last_token_ids_ptr[sample - 1];
+        int end_token_idx = params.last_token_ids_ptr[sample];
+        num_tokens = end_token_idx - start_token_idx;
+    }
+    else
+    {
+        start_token_idx = sample * params.max_seqlen;
+        num_tokens = params.last_token_ids_ptr[sample];
+    }
     int const seq_loops = (num_tokens + SEQ_UNROLL - 1) / SEQ_UNROLL;
 
-    int const input_matrix_row_id = sample * num_tokens;
+    int const input_matrix_row_id = start_token_idx;
 
     if (threadIdx.y == 1)
     {
-        // Data loading warps
-
-        // Bias is independent of token
-        sh_dt_bias[threadIdx.x] = dt_bias[channel];
-        // D is independent of token
-        if (D)
-            sh_D[threadIdx.x] = D[channel];
-
         cuda::pipeline pipeline = cuda::make_pipeline(block, &pipeline_state, cuda::pipeline_role::producer);
 
         int stage = 0;
@@ -128,8 +141,8 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
 
-                input_t* my_B = &B[input_matrix_row_id * DSTATE + token_id * DSTATE];
-                input_t* my_C = &C[input_matrix_row_id * DSTATE + token_id * DSTATE];
+                input_t* my_B = &B[(input_matrix_row_id + token_id) * bc_cols + b_offset];
+                input_t* my_C = &C[(input_matrix_row_id + token_id) * bc_cols + c_offset];
 
                 int block_channel_per_token = blockIdx.x * blockDim.x;
                 int block_channel
@@ -201,10 +214,11 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         float A_reg[DSTATE];
         for (int i = 0; i < DSTATE; i++)
         {
-            // state_reg[i] = toFloat(state[sample*num_channels*DSTATE + i*num_channels + channel]);
             state_reg[i] = 0.f;
             A_reg[i] = toFloat(A[i * num_channels + channel]);
         }
+        float dt_bias_reg = dt_bias[channel];
+        float D_reg = D ? D[channel] : 0.f;
 
         cuda::pipeline pipeline = cuda::make_pipeline(block, &pipeline_state, cuda::pipeline_role::consumer);
         int stage = 0;
@@ -217,14 +231,14 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
             for (int token_id = si * SEQ_UNROLL; token_id < num_tokens && token_id < (si + 1) * SEQ_UNROLL; token_id++)
             {
 
-                float dt_b = toFloat(sh_dt[stage][threadIdx.x]) + toFloat(sh_dt_bias[threadIdx.x]);
+                float dt_b = toFloat(sh_dt[stage][threadIdx.x]) + dt_bias_reg;
                 float dt_b_sp;
                 if (dt_softplus)
                 {
-                    dt_b_sp = dt_b <= 20.f ? log1pf(__expf(dt_b)) : dt_b; // softplus
+                    dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
                 }
                 float my_x = toFloat(sh_x[stage][threadIdx.x]);
-                float Dx = my_x * (D ? toFloat(sh_D[threadIdx.x]) : 0.f);
+                float Dx = my_x * D_reg;
                 float dtx = dt_b_sp * my_x;
                 float my_z = z ? toFloat(sh_z[stage][threadIdx.x]) : 0.f;
 
@@ -284,7 +298,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
                 {
                     float enz = __expf(0.f - my_z);
                     enz += 1.0;
-                    float sig_z = 1.0 / enz;
+                    float sig_z = __fdividef(1.f, enz);
                     float silu_z = my_z * sig_z;
                     out *= silu_z;
                 }
@@ -300,7 +314,7 @@ __launch_bounds__(256, 1) __global__ void selective_scan_loop_kernel(SSMParamsBa
         // Write the new state back out to the cache
         for (int i = 0; i < DSTATE; i++)
         {
-            input_t* my_state = &state[sample * num_channels * DSTATE];
+            input_t* my_state = &state[slot_idx * num_channels * DSTATE];
             int offset = i * num_channels + channel;
             convertAndStore(&my_state[offset], state_reg[i]);
         }
@@ -313,17 +327,115 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
     int samples = params.batch;
     int channels = params.dim;
 
+    TLLM_CHECK(params.dstate == 16);
+
     int const threads = 128;
     int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 2);
     dim3 grid(blocks, samples);
     TLLM_CHECK((channels % block.x) == 0);
-
-    TLLM_CHECK(params.is_variable_B);
-    TLLM_CHECK(params.is_variable_C);
-    TLLM_CHECK(params.dstate == 16);
-
     selective_scan_loop_kernel<input_t, weight_t><<<grid, block, 0, stream>>>(params);
+}
+
+template <typename input_t, typename weight_t>
+void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper* driver)
+{
+    int B = params.batch;
+    int L = params.max_seqlen;
+    int H = params.nheads;
+    int P = params.dim / H;
+    int G = params.ngroups;
+    int N = params.dstate;
+    int Q = params.chunk_size;
+
+    int numTokens = params.num_tokens;
+
+    bool dtsp = params.delta_softplus;
+
+    bool hopper = tensorrt_llm::common::getSMVersion() >= 90;
+
+    CudaType tp, wt;
+
+    if (std::is_same_v<input_t, half>)
+        tp = CT_FP16;
+    else if (std::is_same_v<input_t, __nv_bfloat16>)
+        tp = CT_BF16;
+    else
+        return;
+
+    if (std::is_same_v<weight_t, float>)
+        wt = CT_FP32;
+    else if (std::is_same_v<weight_t, input_t>)
+        wt = tp;
+    else
+        return;
+
+    dim3 bds[5], tds[5];
+    int shms[5], useTmas[5];
+    CUtensorMap descs_host[8];
+
+    ChunkCumsumKernelFunc chunk_cumsum
+        = getChunkCumsumKernel(B, L, H, P, G, N, Q, numTokens, &bds[0], &tds[0], &shms[0], tp, wt);
+    ChunkStateKernelFunc chunk_state = getChunkStateKernel(
+        B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[1], &tds[1], &shms[1], &useTmas[1], &descs_host[0], tp);
+    StatePassingKernelFunc state_passing
+        = getStatePassingKernel(B, L, H, P, G, N, Q, numTokens, &bds[2], &tds[2], &shms[2], tp);
+    BmmChunkKernelFunc bmm_chunk = getBmmChunkKernel(
+        B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[3], &tds[3], &shms[3], &useTmas[3], &descs_host[2], tp);
+    ChunkScanKernelFunc chunk_scan = getChunkScanKernel(B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[4],
+        &tds[4], &shms[4], &useTmas[4], &descs_host[4], tp, wt);
+
+    void* mxY = params.out_ptr;
+    void* mxOs = params.Os_ptr;
+    void* mxFs = params.x_ptr;
+    void* mxSt = params.St_ptr;
+    void* mxdc = params.dc_ptr;
+    void* mxdA = params.dA_ptr;
+    void const* mxdt = params.delta_ptr;
+    void const* mxdb = params.delta_bias_ptr;
+    void const* mxA = params.A_ptr;
+    void* mxCB = params.CB_ptr;
+    void const* mxD = params.D_ptr;
+    void const* mxXBC = params.u_ptr;
+    void const* mxZ = params.z_ptr;
+
+    if (useTmas[1] || useTmas[3] || useTmas[4])
+    {
+        // chunk_state
+        *(void**) &descs_host[0] = (input_t*) mxXBC + H * P; // B
+        *(void**) &descs_host[1] = (input_t*) mxXBC;         // X
+        // bmm_chunk
+        *(void**) &descs_host[2] = (input_t*) mxXBC + H * P + G * N; // C
+        *(void**) &descs_host[3] = (input_t*) mxXBC + H * P;         // B
+        // chunk_scan
+        *(void**) &descs_host[4] = (input_t*) mxXBC + H * P + G * N; // C
+        *(void**) &descs_host[5] = (input_t*) mxOs;
+        *(void**) &descs_host[6] = (input_t*) mxCB;
+        *(void**) &descs_host[7] = (input_t*) mxXBC; // X
+
+        cudaMemcpyAsync(params.desc_ptr, descs_host, sizeof(CUtensorMap) * 8, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream); // to assure cudaMemcpyAsync is finished
+    }
+
+    CUtensorMap* descs = (CUtensorMap*) params.desc_ptr;
+
+    auto rp = params.remove_padding;
+    auto ltip = params.last_token_ids_ptr;
+    auto ssmp = params.slot_mapping_ptr;
+
+    cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
+    chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(
+        B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip, dtsp);
+    cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
+    chunk_state<<<bds[1], tds[1], shms[1], stream>>>(
+        B, L, H, P, G, N, mxSt, mxdc, mxdA, (useTmas[1] ? &descs[0] : mxXBC), rp, ltip);
+    cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
+    state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, G, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
+    cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
+    bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, (useTmas[3] ? &descs[2] : mxXBC), rp, ltip);
+    cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
+    chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
+        B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, (useTmas[4] ? &descs[4] : mxXBC), mxZ, rp, ltip);
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(input_t, weight_t)                                                        \
@@ -336,9 +448,21 @@ INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(__nv_bfloat16, float);
 #endif
 #undef INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE
 
+#define INSTANTIATE_CHUNK_SCAN_DATA_TYPE(input_t, weight_t)                                                            \
+    template void invokeChunkScan<input_t, weight_t>(                                                                  \
+        SSMParamsBase & params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper * driver);
+
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(float, float);
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(half, float);
+#ifdef ENABLE_BF16
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(__nv_bfloat16, float);
+#endif
+#undef INSTANTIATE_CHUNK_SCAN_DATA_TYPE
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128>
+template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, bool MAMBA_V1 = true,
+    int STATE_UNROLL = 16>
 __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParamsBase params)
 {
 
@@ -347,70 +471,116 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     input_t* x = reinterpret_cast<input_t*>(params.u_ptr);
     input_t* dt = reinterpret_cast<input_t*>(params.delta_ptr);
     weight_t* A = reinterpret_cast<weight_t*>(params.A_ptr);
-    input_t* B = reinterpret_cast<input_t*>(params.B_ptr);
-    input_t* C = reinterpret_cast<input_t*>(params.C_ptr);
+    input_t* B = reinterpret_cast<input_t*>(params.BC_ptr);
+    input_t* C = reinterpret_cast<input_t*>(params.BC_ptr);
     weight_t* D = reinterpret_cast<weight_t*>(params.D_ptr);
     input_t* z = reinterpret_cast<input_t*>(params.z_ptr);
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
     bool dt_softplus = params.delta_softplus;
     int num_channels = params.dim;
+    int nheads = params.nheads;
+    int ngroups = params.ngroups;
 
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= num_channels)
         return;
     int const sample = blockIdx.y;
+    int const head_dim = num_channels / nheads;
+    int const head = channel / head_dim;
+    int const head_chl = channel % head_dim;
+    int const group = head / (nheads / ngroups);
 
-    input_t* my_state = &state[sample * num_channels * DSTATE];
+    int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
+    int const dt_d_idx = MAMBA_V1 ? channel : head;
+    int const bc_dim = MAMBA_V1 ? 2 * DSTATE : 2 * ngroups * DSTATE;
+    int const x_dim = MAMBA_V1 ? num_channels : num_channels + bc_dim;
+    int const z_dim = MAMBA_V1 ? num_channels : 2 * num_channels + bc_dim + nheads;
+    int const dt_dim = MAMBA_V1 ? num_channels : (z ? z_dim : z_dim - num_channels);
+    int const dt_offset = MAMBA_V1 ? sample * dt_dim : sample * dt_dim + dt_dim - nheads;
+    int const bc_offset = MAMBA_V1 ? sample * (bc_dim + params.dt_rank) : sample * (num_channels + bc_dim);
+    int const b_offset = MAMBA_V1 ? params.dt_rank : num_channels + DSTATE * group;
+    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : num_channels + DSTATE * (ngroups + group);
+
+    input_t* my_state = &state[slot_idx * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
 
-    float rA[DSTATE];
-    float rB[DSTATE];
-    float rC[DSTATE];
+    int const state_loops = (DSTATE + STATE_UNROLL - 1) / STATE_UNROLL;
 
-    float rState[DSTATE];
-
-#pragma unroll
-    for (int i = 0; i < DSTATE; i++)
-    {
-        rA[i] = toFloat(A[i * num_channels + channel]);
-        rB[i] = toFloat(B[sample * DSTATE + i]);
-        rC[i] = toFloat(C[sample * DSTATE + i]);
-        rState[i] = toFloat(my_state[i * num_channels + channel]);
-    }
-
-    float my_x, my_dt, my_z, my_dt_bias, my_D;
-    my_x = toFloat(x[sample * num_channels + channel]);
-    my_dt = toFloat(dt[sample * num_channels + channel]);
-    my_z = z ? toFloat(z[sample * num_channels + channel]) : 0.f;
-    my_dt_bias = dt_bias ? toFloat(dt_bias[channel]) : 0.f;
-    my_D = D ? toFloat(D[channel]) : 0.f;
+    float my_x, my_dt, my_z, my_dt_bias, out;
+    my_x = toFloat(x[sample * x_dim + channel]);
+    my_z = z ? toFloat(z[sample * z_dim + channel]) : 0.f;
+    my_dt = toFloat(dt[dt_offset + dt_d_idx]);
+    my_dt_bias = dt_bias ? toFloat(dt_bias[dt_d_idx]) : 0.f;
+    out = D ? toFloat(D[dt_d_idx]) * my_x : 0.f;
 
     float dt_b = my_dt + my_dt_bias;
-    float dt_b_sp;
+    float dt_b_sp = 1.0f;
     if (dt_softplus)
     {
-        dt_b_sp = dt_b <= 20.f ? logf(1.f + expf(dt_b)) : dt_b; // softplus
+        dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
     }
 
-    float out = 0.f;
-
-#pragma unroll
-    for (int i = 0; i < DSTATE; i++)
+    if (MAMBA_V1)
     {
-        float dA = expf(rA[i] * dt_b_sp);
-        float dB = rB[i] * dt_b_sp;
-        float sdA = rState[i] * dA;
-        float dBx = dB * my_x;
-        float newState = sdA + dBx;
-        convertAndStore(&my_state[i * num_channels + channel], newState); // Write the new state back out to the cache
-        out += newState * rC[i];
+        float rA[DSTATE];
+        float rB[DSTATE];
+        float rC[DSTATE];
+        float rState[DSTATE];
+#pragma unroll
+        for (int i = 0; i < DSTATE; i++)
+        {
+            rA[i] = toFloat(A[i * num_channels + channel]);
+            rB[i] = toFloat(B[bc_offset + b_offset + i]);
+            rC[i] = toFloat(C[bc_offset + c_offset + i]);
+            rState[i] = toFloat(my_state[i * num_channels + channel]);
+        }
+#pragma unroll
+        for (int i = 0; i < DSTATE; i++)
+        {
+            float dA = __expf(rA[i] * dt_b_sp);
+            float dB = rB[i] * dt_b_sp;
+            float sdA = rState[i] * dA;
+            float dBx = dB * my_x;
+            float newState = sdA + dBx;
+            // Write the new state back out to the cache
+            convertAndStore(&my_state[i * num_channels + channel], newState);
+            out += newState * rC[i];
+        }
+    }
+    else
+    {
+        float A_tmp = toFloat(A[head]);
+        float rB[STATE_UNROLL];
+        float rC[STATE_UNROLL];
+        float rState[STATE_UNROLL];
+        for (int si = 0; si < state_loops; si++)
+        {
+            int i_offset = si * STATE_UNROLL;
+#pragma unroll
+            for (int i = 0; i < STATE_UNROLL; i++)
+            {
+                rB[i] = toFloat(B[bc_offset + b_offset + i_offset + i]);
+                rC[i] = toFloat(C[bc_offset + c_offset + i_offset + i]);
+                rState[i] = toFloat(my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl]);
+            }
+#pragma unroll
+            for (int i = 0; i < STATE_UNROLL; i++)
+            {
+                float dA = __expf(A_tmp * dt_b_sp);
+                float dB = rB[i] * dt_b_sp;
+                float sdA = rState[i] * dA;
+                float dBx = dB * my_x;
+                float newState = sdA + dBx;
+                // Write the new state back out to the cache
+                convertAndStore(&my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl], newState);
+                out += newState * rC[i];
+            }
+        }
     }
 
-    if (D)
-        out += my_D * my_x;
     if (z)
     {
-        float sig_z = 1.0 / (1.0 + exp(0.f - my_z));
+        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - my_z)));
         float silu_z = my_z * sig_z;
         out *= silu_z;
     }
@@ -423,16 +593,25 @@ void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream)
 {
     int samples = params.batch;
     int channels = params.dim;
+    int nheads = params.nheads;
+    int ngroups = params.ngroups;
 
     int const threads = 128;
     int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 1);
     dim3 grid(blocks, samples);
 
-    TLLM_CHECK(params.is_variable_B);
-    TLLM_CHECK(params.is_variable_C);
-    TLLM_CHECK(params.dstate == 16);
-    selective_scan_update_kernel<input_t, weight_t><<<grid, block, 0, stream>>>(params);
+    TLLM_CHECK_WITH_INFO(nheads % ngroups == 0, "nheads must be divisible by ngroups");
+    if (params.is_mamab2)
+    {
+        TLLM_CHECK(params.dstate == 128);
+        selective_scan_update_kernel<input_t, weight_t, 128, 128, false><<<grid, block, 0, stream>>>(params);
+    }
+    else
+    {
+        TLLM_CHECK(params.dstate == 16);
+        selective_scan_update_kernel<input_t, weight_t, 16, 128, true><<<grid, block, 0, stream>>>(params);
+    }
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(input_t, weight_t)                                                 \

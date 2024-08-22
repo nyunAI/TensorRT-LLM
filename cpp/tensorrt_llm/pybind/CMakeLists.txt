@@ -30,8 +30,8 @@ set(SRCS
     batch_manager/llmRequest.cpp
     batch_manager/inferenceRequest.cpp
     batch_manager/namedTensor.cpp
-    runtime/generationInput.cpp
-    runtime/generationOutput.cpp)
+    executor/bindings.cpp
+    executor/executor.cpp)
 
 pybind11_add_module(${TRTLLM_PYBIND_MODULE} ${SRCS})
 
@@ -46,6 +46,8 @@ target_link_libraries(
          ${UNDEFINED_FLAG})
 target_compile_definitions(${TRTLLM_PYBIND_MODULE}
                            PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE})
+target_compile_definitions(${TRTLLM_PYBIND_MODULE}
+                           PUBLIC PYBIND11_DETAILED_ERROR_MESSAGES=1)
 
 if(NOT WIN32)
   set_target_properties(

@@ -43,6 +43,16 @@ protected:
 
     void TearDown() override {}
 
+    std::size_t memoryPoolReserved()
+    {
+        return BufferManager::memoryPoolReserved(mStream->getDevice());
+    }
+
+    std::size_t memoryPoolFree()
+    {
+        return BufferManager::memoryPoolFree(mStream->getDevice());
+    }
+
     int mDeviceCount;
     BufferManager::CudaStreamPtr mStream;
 };
@@ -72,7 +82,7 @@ void testRoundTrip(BufferManager& manager)
         inputCpu[i] = convertType<T>(i);
     }
     auto inputGpu = manager.copyFrom(inputCpu, MemoryType::kGPU);
-    auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNED);
+    auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNEDPOOL);
     EXPECT_EQ(inputCpu.size(), outputCpu->getSize());
     manager.getStream().synchronize();
     auto outputCpuTyped = bufferCast<T>(*outputCpu);
@@ -169,4 +179,21 @@ TEST_F(BufferManagerTest, MemPoolAttributes)
     manager.memoryPoolTrimTo(0);
     EXPECT_LE(manager.memoryPoolReserved(), reserved);
     EXPECT_LE(manager.memoryPoolFree(), free);
+}
+
+TEST_F(BufferManagerTest, TrimPoolOnDestruction)
+{
+    auto manager = std::make_unique<BufferManager>(mStream, true); // trim the pool on destruction
+
+    manager->memoryPoolTrimTo(0);
+    auto const reserved = manager->memoryPoolReserved();
+    auto const free = manager->memoryPoolFree();
+    auto constexpr kBytesToReserve = 1 << 20;
+    {
+        auto const mem = manager->allocate(MemoryType::kGPU, kBytesToReserve);
+    }
+    EXPECT_GE(manager->memoryPoolFree(), free + kBytesToReserve);
+    manager.reset();
+    EXPECT_LE(memoryPoolReserved(), reserved);
+    EXPECT_LE(memoryPoolFree(), free);
 }

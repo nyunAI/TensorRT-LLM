@@ -18,9 +18,16 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-
+#include "tensorrt_llm/runtime/lookaheadBuffers.h"
+#include <optional>
 #include <utility>
+
+namespace tensorrt_llm::batch_manager
+{
+class LookaheadDecodingBuffers;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -29,61 +36,88 @@ class DecodingOutput
 public:
     using TensorPtr = ITensor::SharedPtr;
 
+    // BS: batch_size, BM: beam_width, MSL: max_seq_length
+    // All TensorPtr without special comments are on gpu
+
     class BeamHypotheses
     {
     public:
-        TensorPtr outputIdsTgt;       // [batchSize, 2 * beamWidth, maxSeqLen]
-        TensorPtr sequenceLengthsTgt; // [batchSize, 2 * beamWidth]
-        TensorPtr cumLogProbs;        // [batchSize, 2 * beamWidth]
-        TensorPtr normedScores;       // [batchSize, 2 * beamWidth]
-        TensorPtr logProbs;           // [batchSize, 2 * beamWidth, maxSeqLen]
-        TensorPtr minNormedScores;    // [batchSize]
-        TensorPtr numBeams;           // [batchSize]
-        TensorPtr isDone;             // [batchSize]
+        // Keep same as cpp/tensorrt_llm/kernels/beamSearchKernels.h
+        TensorPtr outputIdsCBA;       // [BS, BM*2, MSL]
+        TensorPtr logProbsCBA;        // [BS, BM*2, MSL]
+        TensorPtr sequenceLengthsCBA; // [BS, BM*2]
+        TensorPtr cumLogProbsCBA;     // [BS, BM*2]
+        TensorPtr normedScoresCBA;    // [BS, BM*2]
+        TensorPtr numBeamsCBA;        // [BS]
+        TensorPtr minNormedScoresCBA; // [BS]
+        TensorPtr batchDones;         // [BS]
 
         void empty(BufferManager& manager);
 
-        void reshape(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+        void reshape(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
         void release();
 
         void init(BufferManager& manager, TokenIdType endId);
 
-        BeamHypotheses slice(SizeType batchIndex, SizeType size) const;
+        BeamHypotheses slice(SizeType32 batchIndex, SizeType32 size) const;
     };
 
     static float constexpr kNegativeInfinity = -1e20f;
 
-    explicit DecodingOutput(TensorPtr ids)
+    explicit DecodingOutput(TensorPtr ids, TensorPtr gatheredIds)
         : ids{std::move(ids)}
+        , gatheredIds{std::move(gatheredIds)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
     }
 
     // mandatory parameters
-    TensorPtr ids; // [batchSize, beamWidth, maxSeqLen], on gpu, must contain previously generated token ids for all
-                   // steps before DecodingInput.step
-    TensorPtr newTokensSteps; // [maxTokensPerStep, batchSize, beamWidth] new tokens at each generated token of
-                              // maxTokensPerStep, on gpu.
-    TensorPtr newTokens;      // [batchSize, beamWidth] usually a view of newTokensSteps for the current token, on gpu.
-    std::vector<TensorPtr> newTokensVec; // vector of size maxTokensPerStep with tensor [batchSize, beamWidth].
-                                         // Vector of views on newTokensSteps for each token. Elements are on gpu.
+    TensorPtr ids;                       // [BS, BM, MSL], contains previously generated token ids for all
+                                         // steps before DecodingInput.step
+
+    TensorPtr gatheredIds;               // [BS, BM, MSL], these are the tokens computed during the gatherTree step
+                                         // When doing beam search and streaming, this second set of tokens is needed
+                                         // due to the beam search kernels assuming ungathered tokens (stored in `ids`).
+
+    TensorPtr newTokensSteps;            // [maxTokensPerStep, BS, BM] new tokens at each generated token of
+                                         // maxTokensPerStep
+    TensorPtr newTokens;                 // [BS, BM] usually a view of newTokensSteps for the current token
+    std::vector<TensorPtr> newTokensVec; // vector of size maxTokensPerStep with tensor [BS, BM].
+                                         // Vector of views on newTokensSteps for each token
 
     // optional parameters
-    TensorPtr finished; // [batchSize, beamWidth],
-                        // Set to true by decoding if any of the stop conditions are met or if DecodingInput.finished is
-                        // true. In beam search and to determine whether to stop according to
-                        // DecodingInput.sequenceLimitLength, on gpu
-    TensorPtr finishedSum; // [batchSize], the sum of finished sequences per request, in pinned memory
+    TensorPtr finishReasons; // [BS, BM], set to FinishedState by decoding if any of the stop conditions are met or if
+                             // DecodingInput.finished is true. In beam search and to determine whether to stop
+                             // according to DecodingInput.sequenceLimitLength
+    TensorPtr finishedSum;   // [BS], the sum of finished sequences per request, in pinned memory
 
     // mandatory parameters for beam search
-    TensorPtr logProbs;         // [batchSize, beamWidth, maxSeqLen], must be float*, on gpu
-    TensorPtr cumLogProbs;      // [batchSize, beamWidth], optional for sampling, on gpu
-    TensorPtr parentIds;        // [batchSize, beamWidth, maxSeqLen], on gpu
-    TensorPtr lengths;          // [batchSize, beamWidth], total sequence lengths including padding, on gpu
-    TensorPtr cacheIndirection; // [batchSize, beamWidth, maxSeqLen], k/v indirection for next generation step, on gpu
+    TensorPtr logProbs;         // [BS, BM, MSL], must be float*
+    TensorPtr cumLogProbs;      // [BS, BM], optional for sampling
+    TensorPtr parentIds;        // [BS, BM, MSL]
+    TensorPtr lengths;          // [BS, BM], total sequence lengths including padding
+    TensorPtr cacheIndirection; // [BS, BM, MSL], k/v indirection for next generation step
 
     BeamHypotheses beamHypotheses;
+
+    // Speculative decoding
+    class SpeculativeDecodingOutputs
+    {
+    public:
+        TensorPtr nextDraftTokens;       // [maxBatchSize, maxDraftTokens]
+        TensorPtr nextDraftTokensLen;    // [maxBatchSize]
+        TensorPtr prevDraftTokensLen;    // [maxBatchSize]
+        TensorPtr acceptedTokensLen;     // [maxBatchSize]
+        TensorPtr acceptedLengthsCumSum; // [maxBatchSize + 1]
+        TensorPtr pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep]
+    };
+
+    std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
+
+    std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
+
+    std::optional<LookaheadDecodingBuffers> lookaheadOutputs;
 };
 
 } // namespace tensorrt_llm::runtime

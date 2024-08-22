@@ -36,6 +36,45 @@ namespace tensorrt_llm
 
 namespace kernels
 {
+class CopyBeamHypothesesStruct
+{
+public:
+    TokenIdType const* srcOutputIdsCBA; // [BS, BM*2, MSL]
+    TokenIdType* dstOutputIdsCBA;       // [BS, BM*2, MSL]
+    SizeType32 outputIdsNumElts;
+
+    float const* srcLogProbsCBA; // [BS, BM*2, MSL]
+    float* dstLogProbsCBA;       // [BS, BM*2, MSL]
+    SizeType32 logProbsNumElts;
+
+    SizeType32 const* srcSequenceLengthsCBA; // [BS, BM*2]
+    SizeType32* dstSequenceLengthsCBA;       // [BS, BM*2]
+    SizeType32 sequenceLengthsNumElts;
+
+    float const* srcCumLogProbsCBA; // [BS, BM*2]
+    float* dstCumLogProbsCBA;       // [BS, BM*2]
+    SizeType32 cumLogProbsCBANumElts;
+
+    float const* srcNormedScoresCBA; // [BS, BM*2]
+    float* dstNormedScoresCBA;       // [BS, BM*2]
+    SizeType32 normedScoresNumElts;
+
+    SizeType32 const* srcNumBeamsCBA; // [BS]
+    SizeType32* dstNumBeamsCBA;       // [BS]
+    SizeType32 numBeamsNumElts;
+
+    float const* srcMinNormedScoresCBA; // [BS]
+    float* dstMinNormedScoresCBA;       // [BS]
+    SizeType32 minNormedScoresNumElts;
+
+    bool const* srcBatchDones; // [BS]
+    bool* dstBatchDones;       // [BS]
+    SizeType32 batchDonesNumElts;
+
+    float const* srcCumLogProbs; // [BS, BM]
+    float* dstCumLogProbs;       // [BS, BM]
+    SizeType32 cumLogProbsNumElts;
+};
 
 __global__ void gatherTree(gatherTreeParam param)
 {
@@ -125,17 +164,6 @@ __global__ void gatherTree(gatherTreeParam param)
             }
         }
     }
-}
-
-template <typename T>
-__device__ __forceinline__ T applyLengthPenalty(T logProb, int length, float lengthPenalty)
-{
-    // score = log(prob) / (length ^ lengthPenalty)
-    if (lengthPenalty == 0.0f || length == 1)
-    {
-        return logProb;
-    }
-    return logProb / static_cast<T>(powf(length, lengthPenalty));
 }
 
 struct RankNorm
@@ -292,65 +320,125 @@ void invokeGatherTree(gatherTreeParam param)
     }
 }
 
-__global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    int const* topKOutputIds, int const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
-    float const* topKLogProbs, int const* numBeams, int const* inputLengths, int const beamWidth, int const maxSeqLen)
+__global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
 {
-    // outputIds: [bs, beamWidth, maxSeqLen]
-    // sequenceLengths: [bs, beamWidth]
-    // cumLogProbs: [bs, beamWidth]
-    // outputLogProbs: [bs, beamWidth, maxSeqLen]
-    // topKOutputIds: [bs, 2 * beamWidth, maxSeqLen + 1]
-    // topKSequenceLengths: [bs, 2 * beamWidth]
-    // scores: [bs, 2 * beamWidth]
-    // topKCumLogProbs: [bs, 2 * beamWidth]
-    // topKLogProbs: [bs, 2 * beamWidth, maxSeqLen + 1]
-    // numBeams: [bs]
+    // Move ALL unfinished beams from bh.outputIdsUnfinish to bh.outputIdsCBA
+    // So here might be more than `nBM` beams in bh.outputIdsCBA after the call
+    // bh.outputIdsUnfinish -> bh.outputIdsCBA
+    // bh.sequenceLengths   -> bh.sequenceLengthsCBA
+    // bh.cumLogProbs       -> bh.cumLogProbsCBA
+    // bh.logProbsTiled     -> bh.logProbsCBA
+    // update bh.normedScoresCBA
+    // update bh.numBeamsCBA
 
-    // This kernel do a sorting for scores first, and then put the topKOutputIds
-    // into outputIds by the rank of scores.
-    // Note that we remove the start_token (the id at first position) from topKOutputIds
+    int const bid = blockIdx.x;       // Index of Batch
+    int const nBM{bh.nBeamWidth};
+    int const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
+    int const nMSL{bh.nMaxSeqLen};
+    bool const bOutputLogProbs{bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr};
+    int const indexDstStart{bh.numBeamsCBA[bid]};
 
-    extern __shared__ char array[];
-    int* sRank = (int*) (array);                              // [beamWidth]
-    float* sScores = (float*) (sRank + beamWidth);            // [2 * beamWidth]
-    int* sSequenceLengths = (int*) (sScores + beamWidth * 2); // [beamWidth]
-    int const numBeam = numBeams[blockIdx.x];
-    if (threadIdx.x < numBeam)
+    if (bh.batchDones[bid])
     {
-        sScores[threadIdx.x] = scores[blockIdx.x * beamWidth * 2 + threadIdx.x];
+        return;
+    }
+
+    for (int i = 0; i < nBM; ++i)
+    {
+        int const srcBeam = bid * nBM + i;
+        int const dstBeam = bid * nBM * 2 + i + indexDstStart;
+        int const step = bh.sequenceLengths[srcBeam] - 1;
+
+        // The last token
+        int const srcId = srcBeam * nMSL + step;
+        int const dstId = dstBeam * nMSL + step;
+        bh.outputIdsCBA[dstId] = bh.outputIdsUnfinish[srcId];
+        if (bOutputLogProbs)
+        {
+            bh.logProbsCBA[dstId] = bh.logProbsTiled[step * nMBS * nBM + srcBeam];
+        }
+        // Previous tokens
+        int prevId = bh.parentIdsUnfinish[srcId];
+        for (int j = step - 1; j >= 0; --j)
+        {
+            int const index = bid * nBM * nMSL + prevId * nMSL + j;
+            bh.outputIdsCBA[dstBeam * nMSL + j] = bh.outputIdsUnfinish[index];
+            prevId = bh.parentIdsUnfinish[index];
+        }
+        if (bOutputLogProbs)
+        {
+            prevId = bh.parentIdsUnfinish[srcId];
+            for (int j = step - 1; j >= 0; --j)
+            {
+                int const index = bid * nBM * nMSL + prevId * nMSL + j;
+                bh.logProbsCBA[dstBeam * nMSL + j] = bh.logProbsTiled[j * nMBS * nBM + bid * nBM + prevId];
+                prevId = bh.parentIdsUnfinish[index];
+            }
+        }
+        // Other parameters
+        bh.sequenceLengthsCBA[dstBeam] = bh.sequenceLengths[srcBeam];
+        bh.normedScoresCBA[dstBeam]
+            = applyLengthPenalty(bh.cumLogProbs[srcBeam], step - bh.inputLengths[srcBeam] + 1, bh.lengthPenalties[bid]);
+        bh.cumLogProbsCBA[dstBeam] = bh.cumLogProbs[srcBeam];
+        bh.numBeamsCBA[bid]++;
+    }
+}
+
+void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
+{
+    insertUnfinishedPathKernel<<<bh.nBatchSize, 1, 0, stream>>>(bh);
+}
+
+__global__ void finalizeKernel(BeamHypotheses bh)
+{
+    // Do index sort on bh.normedScoresCBA, then move buffers from CBA to output by the order of index
+    // bh.outputIdsCBA       -> bh.outputIds
+    // bh.sequenceLengthsCBA -> bh.sequenceLengths
+    // bh.cumLogProbsCBA     -> bh.cumLogProbs
+    // bh.logProbsCBA        -> bh.logProbs
+
+    int const bid = blockIdx.x;          // Index of Batch
+    int const tid = threadIdx.x;         // Index of Beam
+    int const nBM{bh.nBeamWidth};
+    int const nCBA{bh.numBeamsCBA[bid]}; // count of candidate beams in CBA, nBM <= nCBA <= 2*nBM
+    int const nMSL{bh.nMaxSeqLen};
+
+    extern __shared__ char smem[];
+    int* smemRank = (int*) (smem);                // [nBM]
+    float* smemScore = (float*) (smemRank + nBM); // [2*nBM]
+    int* smemSL = (int*) (smemScore + nBM * 2);   // [nBM]
+
+    // Sort
+    if (tid < nCBA)
+    {
+        smemScore[tid] = bh.normedScoresCBA[bid * nBM * 2 + tid];
     }
     __syncthreads();
-
-    if (numBeam < 32)
+    if (nCBA < 32)
     {
-        int const beamIdx = threadIdx.x;
-        RankNorm rankNorm;
-        rankNorm.rank = beamIdx;
-        rankNorm.norm = beamIdx < numBeam ? sScores[beamIdx] : -FLT_MAX;
+        int const warpid = tid / 32;
+        int const laneid = tid % 32;
+        RankNorm rankNorm{tid, tid < nCBA ? smemScore[tid] : -FLT_MAX};
 
-        int warpid = threadIdx.x / 32;
-        int laneid = threadIdx.x % 32;
-
-        if (warpid == 0 && numBeam > 1)
+        if (warpid == 0 && nCBA > 1)
         {
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 1) ^ bfe(laneid, 0)); //  2
         }
 
-        if (warpid == 0 && numBeam > 2)
+        if (warpid == 0 && nCBA > 2)
         {
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 2) ^ bfe(laneid, 1)); //  3~4
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 2) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && numBeam > 4)
+        if (warpid == 0 && nCBA > 4)
         {
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 3) ^ bfe(laneid, 2)); //  5~8
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 3) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 3) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && numBeam > 8)
+        if (warpid == 0 && nCBA > 8)
         {
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3)); // 9~16
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 4) ^ bfe(laneid, 2));
@@ -358,7 +446,7 @@ __global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProb
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && numBeam > 16)
+        if (warpid == 0 && nCBA > 16)
         {
             rankNorm = swap(rankNorm, 0x10, bfe(laneid, 4) ^ bfe(laneid, 4)); // 17~32
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3));
@@ -367,28 +455,26 @@ __global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProb
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (beamIdx < beamWidth)
+        if (tid < nBM)
         {
-            sRank[beamIdx] = rankNorm.rank;
+            smemRank[tid] = rankNorm.rank;
         }
-
         __syncthreads();
     }
     else
     {
-        for (int i = 0; i < beamWidth; i++)
+        for (int i = 0; i < nBM; ++i)
         {
-            float score = threadIdx.x < numBeams[blockIdx.x] ? sScores[threadIdx.x] : -FLT_MAX;
-            float maxScore = blockReduceMax<float>(score);
-
-            if (threadIdx.x == 0)
+            float const score = tid < bh.numBeamsCBA[bid] ? smemScore[tid] : -FLT_MAX;
+            float const maxScore = blockReduceMax<float>(score);
+            if (tid == 0)
             {
-                for (int j = 0; j < beamWidth * 2; j++)
+                for (int j = 0; j < nBM * 2; ++j)
                 {
-                    if (sScores[j] == maxScore)
+                    if (smemScore[j] == maxScore)
                     {
-                        sRank[i] = j;
-                        sScores[j] = -FLT_MAX;
+                        smemRank[i] = j;
+                        smemScore[j] = -FLT_MAX;
                         break;
                     }
                 }
@@ -397,104 +483,215 @@ __global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProb
         }
     }
 
-    if (threadIdx.x < beamWidth)
+    // Move bh.sequenceLengths, bh.cumLogProbs
+    if (tid < nBM)
     {
-        sSequenceLengths[threadIdx.x] = topKSequenceLengths[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
-        sequenceLengths[blockIdx.x * beamWidth + threadIdx.x] = sSequenceLengths[threadIdx.x];
-
-        if (cumLogProbs != nullptr)
+        smemSL[tid] = bh.sequenceLengthsCBA[bid * nBM * 2 + smemRank[tid]];
+        bh.sequenceLengths[bid * nBM + tid] = smemSL[tid];
+        if (bh.cumLogProbs != nullptr)
         {
-            cumLogProbs[blockIdx.x * beamWidth + threadIdx.x]
-                = topKCumLogProbs[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
+            bh.cumLogProbs[bid * nBM + tid] = bh.cumLogProbsCBA[bid * nBM * 2 + smemRank[tid]];
         }
     }
     __syncthreads();
 
-    for (int beamIdx = 0; beamIdx < beamWidth; beamIdx++)
+    // Move bh.outputIds, bh.logProbs
+    for (int beamIdx = 0; beamIdx < nBM; beamIdx++)
     {
-        // start from step 1 to skip the start token
-        for (int i = threadIdx.x; i < sSequenceLengths[beamIdx]; i += blockDim.x)
+        for (int i = tid; i < smemSL[beamIdx]; i += blockDim.x)
         {
-            outputIds[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i]
-                = topKOutputIds[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
-            if (outputLogProbs != nullptr)
+            int const dst = bid * nBM * nMSL + beamIdx * nMSL + i;
+            int const src = bid * nBM * 2 * nMSL + smemRank[beamIdx] * nMSL + i;
+            bh.outputIds[dst] = bh.outputIdsCBA[src];
+        }
+        if (bh.logProbs != nullptr)
+        {
+            for (int i = tid; i < smemSL[beamIdx]; i += blockDim.x)
             {
-                int inputLen = inputLengths[blockIdx.x * beamWidth + beamIdx];
-                if (i >= inputLen)
+                if (int const inputLength = bh.inputLengths[bid * nBM + beamIdx]; i >= inputLength)
                 {
-                    outputLogProbs[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i - inputLen]
-                        = topKLogProbs[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
+                    int const dst = bid * nBM * nMSL + beamIdx * nMSL + i;
+                    int const src = bid * nBM * 2 * nMSL + smemRank[beamIdx] * nMSL + i;
+                    bh.logProbs[dst - inputLength] = bh.logProbsCBA[src];
                 }
             }
         }
     }
 }
 
-void invokeFinalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    int const* topKOutputIds, int const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
-    float const* topKLogProbs, int const* numBeams, int const* inputLengths, int const beamWidth, int const maxSeqLen,
-    int const batchSize, cudaStream_t stream)
+void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
-    TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
-    dim3 block(beamWidth * 2);
-    block.x = (block.x + 31) / 32 * 32;
-    TLLM_CHECK(block.x < 1024);
-    finalize<<<batchSize, block, beamWidth * sizeof(int) * 2 + (beamWidth * 2) * sizeof(float), stream>>>(outputIds,
-        sequenceLengths, cumLogProbs, outputLogProbs, topKOutputIds, topKSequenceLengths, scores, topKCumLogProbs,
-        topKLogProbs, numBeams, inputLengths, beamWidth, maxSeqLen);
+    TLLM_LOG_TRACE("%s %s start", __FILE__, __PRETTY_FUNCTION__);
+
+    int const nBM = bh.nBeamWidth;
+    size_t const smem_size = sizeof(int) * nBM * 2 + sizeof(float) * nBM * 2;
+    finalizeKernel<<<bh.nBatchSize, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
+    TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
 
-__global__ void initializeOutput(int* outputIds, int const* endIds, int const maxSeqLen)
+__global__ void copyBeamHypotheses(CopyBeamHypothesesStruct copyStruct)
 {
-    for (int i = threadIdx.x; i < maxSeqLen; i += blockDim.x)
+    auto const idx = static_cast<SizeType32>(threadIdx.x + blockIdx.x * blockDim.x);
+    auto const stride = static_cast<SizeType32>(blockDim.x * gridDim.x);
+
+    for (SizeType32 ii = idx; ii < copyStruct.outputIdsNumElts; ii += stride)
     {
-        outputIds[blockIdx.x * maxSeqLen + i] = endIds[blockIdx.x];
+        copyStruct.dstOutputIdsCBA[ii] = copyStruct.srcOutputIdsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.logProbsNumElts; ii += stride)
+    {
+        copyStruct.dstLogProbsCBA[ii] = copyStruct.srcLogProbsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.cumLogProbsNumElts; ii += stride)
+    {
+        copyStruct.dstCumLogProbs[ii] = copyStruct.srcCumLogProbs[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.sequenceLengthsNumElts; ii += stride)
+    {
+        copyStruct.dstSequenceLengthsCBA[ii] = copyStruct.srcSequenceLengthsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.cumLogProbsCBANumElts; ii += stride)
+    {
+        copyStruct.dstCumLogProbsCBA[ii] = copyStruct.srcCumLogProbsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.normedScoresNumElts; ii += stride)
+    {
+        copyStruct.dstNormedScoresCBA[ii] = copyStruct.srcNormedScoresCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.numBeamsNumElts; ii += stride)
+    {
+        copyStruct.dstNumBeamsCBA[ii] = copyStruct.srcNumBeamsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.minNormedScoresNumElts; ii += stride)
+    {
+        copyStruct.dstMinNormedScoresCBA[ii] = copyStruct.srcMinNormedScoresCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.batchDonesNumElts; ii += stride)
+    {
+        copyStruct.dstBatchDones[ii] = copyStruct.srcBatchDones[ii];
     }
 }
 
-void invokeInitializeOutput(int* outputIds, int const* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream)
+void invokeCopyBeamHypotheses(DecodingOutput::BeamHypotheses const& src, DecodingOutput::BeamHypotheses const& dst,
+    ITensor& srcCumLogProbs, ITensor& dstCumLogProbs, runtime::CudaStream const& stream, SizeType32 numSMs)
 {
-    initializeOutput<<<batchBeam, 256, 0, stream>>>(outputIds, endIds, maxSeqLen);
+    CopyBeamHypothesesStruct copyStruct = {};
+
+    copyStruct.srcOutputIdsCBA = bufferCast<TokenIdType>(*(src.outputIdsCBA));
+    copyStruct.dstOutputIdsCBA = bufferCast<TokenIdType>(*(dst.outputIdsCBA));
+    copyStruct.outputIdsNumElts = dst.outputIdsCBA->getSize();
+
+    copyStruct.srcLogProbsCBA = bufferCast<float>(*(src.logProbsCBA));
+    copyStruct.dstLogProbsCBA = bufferCast<float>(*(dst.logProbsCBA));
+    copyStruct.logProbsNumElts = dst.logProbsCBA->getSize();
+
+    copyStruct.srcSequenceLengthsCBA = bufferCast<SizeType32>(*(src.sequenceLengthsCBA));
+    copyStruct.dstSequenceLengthsCBA = bufferCast<SizeType32>(*(dst.sequenceLengthsCBA));
+    copyStruct.sequenceLengthsNumElts = dst.sequenceLengthsCBA->getSize();
+
+    copyStruct.srcCumLogProbsCBA = bufferCast<float>(*(src.cumLogProbsCBA));
+    copyStruct.dstCumLogProbsCBA = bufferCast<float>(*(dst.cumLogProbsCBA));
+    copyStruct.cumLogProbsCBANumElts = dst.cumLogProbsCBA->getSize();
+
+    copyStruct.srcNormedScoresCBA = bufferCast<float>(*(src.normedScoresCBA));
+    copyStruct.dstNormedScoresCBA = bufferCast<float>(*(dst.normedScoresCBA));
+    copyStruct.normedScoresNumElts = dst.normedScoresCBA->getSize();
+
+    copyStruct.srcNumBeamsCBA = bufferCast<SizeType32>(*(src.numBeamsCBA));
+    copyStruct.dstNumBeamsCBA = bufferCast<SizeType32>(*(dst.numBeamsCBA));
+    copyStruct.numBeamsNumElts = dst.numBeamsCBA->getSize();
+
+    copyStruct.srcMinNormedScoresCBA = bufferCast<float>(*(src.minNormedScoresCBA));
+    copyStruct.dstMinNormedScoresCBA = bufferCast<float>(*(dst.minNormedScoresCBA));
+    copyStruct.minNormedScoresNumElts = dst.minNormedScoresCBA->getSize();
+
+    copyStruct.srcBatchDones = bufferCast<bool>(*(src.batchDones));
+    copyStruct.dstBatchDones = bufferCast<bool>(*(dst.batchDones));
+    copyStruct.batchDonesNumElts = dst.batchDones->getSize();
+
+    copyStruct.srcCumLogProbs = bufferCast<float>(srcCumLogProbs);
+    copyStruct.dstCumLogProbs = bufferCast<float>(dstCumLogProbs);
+    copyStruct.cumLogProbsNumElts = srcCumLogProbs.getSize();
+
+    copyBeamHypotheses<<<numSMs, 256, 0, stream.get()>>>(copyStruct);
 }
 
-__global__ void copyNextStepIds(int* nextStepIds, int** outputIdsPtr, int const* sequenceLengths, int const* batchSlots,
-    int batchSize, int beamWidth, int maxSeqLen)
+__global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const nMaxSeqLen)
 {
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * beamWidth;
-         index += blockDim.x * gridDim.x)
+    for (int i = threadIdx.x; i < nMaxSeqLen; i += blockDim.x)
     {
-        int const batchIdx{index / beamWidth};
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
-        int const beamIdx{index % beamWidth};
+        finalOutputIds[blockIdx.x * nMaxSeqLen + i] = endIds[blockIdx.x];
+    }
+}
+
+void invokeInitializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const batchBeam,
+    SizeType32 const nMaxSeqLen, cudaStream_t stream)
+{
+    initializeOutput<<<batchBeam, 256, 0, stream>>>(finalOutputIds, endIds, nMaxSeqLen);
+}
+
+__global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,
+    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots,
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxTokensPerStep)
+{
+    for (auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+         index < batchSize * beamWidth * maxTokensPerStep; index += static_cast<SizeType32>(blockDim.x * gridDim.x))
+    {
+        // numNewTokens == nullptr when Medusa is disabled
+        auto const batchIdx{index / (beamWidth * maxTokensPerStep)};
+        auto const batchSlot{batchSlots[batchIdx]};
+        auto const remainder{index % (beamWidth * maxTokensPerStep)};
+        auto const beamIdx{remainder / maxTokensPerStep};
+        auto const tokenIdx{remainder % maxTokensPerStep};
+        auto const newTokens{numNewTokens == nullptr ? 1 : numNewTokens[batchSlot]};
         auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
-        nextStepIds[batchBeamIdx] = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + sequenceLengths[batchBeamIdx] - 1];
+        auto const tokenBatchBeamIdx = tokenIdx * maxBatchSize * beamWidth + batchSlot * beamWidth + beamIdx;
+        auto const indexSrc = sequenceLengths[batchBeamIdx] - newTokens + tokenIdx;
+        if (tokenIdx >= newTokens || indexSrc < 0)
+        {
+            continue;
+        }
+        nextStepIds[tokenBatchBeamIdx] = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + indexSrc];
     }
 }
 
-void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, int const* sequenceLengths, int const* batchSlots,
-    int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
+void invokeCopyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,
+    SizeType32 const* sequenceLengths, SizeType32 const* numNewTokens, SizeType32 const* batchSlots,
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxTokensPerStep, cudaStream_t stream)
 {
-    dim3 block(min(256, batchSize * beamWidth));
-    dim3 grid(divUp(batchSize * beamWidth, block.x));
-    copyNextStepIds<<<grid, block, 0, stream>>>(
-        nextStepIds, outputIdsPtr, sequenceLengths, batchSlots, batchSize, beamWidth, maxSeqLen);
+    int const numElems = batchSize * beamWidth * maxTokensPerStep;
+    dim3 block(min(256, numElems));
+    dim3 grid(divUp(numElems, block.x));
+    copyNextStepIds<<<grid, block, 0, stream>>>(nextStepIds, outputIdsPtr, sequenceLengths, numNewTokens, batchSlots,
+        batchSize, maxBatchSize, beamWidth, maxSeqLen, maxTokensPerStep);
 }
 
-__global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, int const* sequenceLengths,
-    int const* batchSlots, int batchSize, int maxBatchSize, int beamWidth, int maxSeqLen)
+__global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, SizeType32 const* sequenceLengths,
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen)
 {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
 
-    int const batchIdx = index / (beamWidth * maxSeqLen);
-    int const tmpIdx = index % (beamWidth * maxSeqLen);
-    int const beamIdx = tmpIdx / maxSeqLen;
-    int const pos = tmpIdx % maxSeqLen;
+    auto const batchIdx = index / (beamWidth * maxSeqLen);
+    auto const tmpIdx = index % (beamWidth * maxSeqLen);
+    auto const beamIdx = tmpIdx / maxSeqLen;
+    auto const pos = tmpIdx % maxSeqLen;
     if (batchIdx >= batchSize)
     {
         return;
     }
 
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
     if (pos < sequenceLengths[batchSlot])
     {
         auto const batchBeamIdx = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
@@ -503,352 +700,15 @@ __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTi
     }
 }
 
-void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, int const* sequenceLengths,
-    int const* batchSlots, int batchSize, int maxBatchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
+void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, SizeType32 const* sequenceLengths,
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
+    SizeType32 maxSeqLen, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid(divUp(batchSize * beamWidth * maxSeqLen, block.x));
     transposeLogProbs<<<grid, block, 0, stream>>>(outputLogProbs, outputLogProbsTiled, sequenceLengths, batchSlots,
         batchSize, maxBatchSize, beamWidth, maxSeqLen);
 }
-
-__global__ void acceptDraftTokensByIds(int32_t const* draftIds, int32_t const* targetIds, int32_t const* contextLengths,
-    int32_t const* numsDraftTokens, int32_t* sequenceLengths, FinishedState const* finished,
-    FinishedState* finishedFinal, int32_t* finishedSum, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t maxSeqLen, int32_t maxDraftTokens)
-{
-    for (int batchIdx = threadIdx.x; batchIdx < batchSize; batchIdx += blockDim.x)
-    {
-        auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
-        auto const numDraftTokens = numsDraftTokens[batchSlot];
-
-        auto const contextLength = contextLengths[batchSlot];
-        auto& sequenceLength = sequenceLengths[batchSlot];
-        int finishedDraftIdx = 0;
-        for (int ti = contextLength; ti < min(sequenceLength, contextLength + numDraftTokens); ++ti, ++finishedDraftIdx)
-        {
-            auto const draftIdx = ti - contextLength;
-            auto const targetTokenIdx = batchSlot * maxSeqLen + ti;
-            auto const draftTokenIdx = batchSlot * maxDraftTokens + draftIdx;
-            // Check if draft tokens are the same as target tokens
-            bool const accepted = draftIds[draftTokenIdx] == targetIds[targetTokenIdx];
-            if (!accepted)
-            {
-                // Set sequence length to the numAcceptedTokens + 1
-                sequenceLength = min(ti + 1, maxSeqLen);
-                // FIXME(nkorobov): do we need to set endIds here?
-                break;
-            }
-        }
-        FinishedState finishState = finished[finishedDraftIdx * maxBatchSize + batchSlot];
-        finishedFinal[batchSlot] = finishState;
-
-        if (finishedSum)
-        {
-            finishedSum[batchSlot] = static_cast<int>(finishState.isFinished());
-        }
-    }
-}
-
-void invokeAcceptDraftTokensByIds(int32_t const* draftIds, int32_t const* targetIds, int32_t const* contextLengths,
-    int32_t const* numsDraftTokens, int32_t* sequenceLengths, FinishedState const* finished,
-    FinishedState* finishedFinal, int32_t* finishedSum, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t beamWidth, int32_t maxSeqLen, int32_t maxDraftTokens, cudaStream_t stream)
-{
-    TLLM_CHECK(beamWidth == 1);
-    dim3 block(min(1024, batchSize));
-    dim3 grid(1);
-    acceptDraftTokensByIds<<<grid, block, 0, stream>>>(draftIds, targetIds, contextLengths, numsDraftTokens,
-        sequenceLengths, finished, finishedFinal, finishedSum, batchSlots, batchSize, maxBatchSize, maxSeqLen,
-        maxDraftTokens);
-}
-
-template <typename T>
-__global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetProbs, int32_t const* numsDraftTokens,
-    FinishedState* finished, curandState_t* curandState, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t maxDraftTokens, int32_t beamWidth, int32_t vocabSize, bool randomThreshold,
-    float constantThreshold)
-{
-    auto const bid = blockIdx.x;
-    auto const draftTokenIdx = blockIdx.y;
-    auto const batchIdx = bid / beamWidth;
-    auto const beamIdx = bid % beamWidth;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
-    auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
-
-    auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
-
-    if (draftTokenIdx >= numDraftTokens)
-    {
-        return;
-    }
-
-    auto const logitsOffset = (batchSlot * maxDraftTokens + draftTokenIdx) * beamWidth * vocabSize;
-    auto const draftProbsBatch = draftProbs + logitsOffset;
-    auto const targetProbsBatch = targetProbs + logitsOffset;
-
-    int32_t rejected = 0;
-    auto vocabSizePadded = static_cast<int32_t>((vocabSize + blockDim.x - 1) / blockDim.x) * blockDim.x;
-
-    for (int32_t vIdx = threadIdx.x; vIdx < vocabSizePadded; vIdx += blockDim.x)
-    {
-        if (rejected > 0)
-        {
-            break;
-        }
-
-        // FIXME(nkorobov): We compare probability distributions, but it might make sense to compare probabilities of
-        // the selected tokens based on the https://arxiv.org/pdf/2302.01318.pdf
-        bool const pred = vIdx < vocabSize;
-        auto const threshold
-            = pred ? (randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold) : 0.f;
-        auto const targetProb = pred ? static_cast<float>(targetProbsBatch[vIdx]) : 1.f;
-        auto const draftProb = pred ? static_cast<float>(draftProbsBatch[vIdx]) : 0.f;
-
-        rejected = __syncthreads_count(targetProb < threshold * draftProb);
-    }
-    if (threadIdx.x == 0)
-    {
-        finished[draftTokenIdx * maxBatchSize * beamWidth + batchSlotBeamWidth]
-            = rejected > 0 ? FinishedState::skipDecoding() : FinishedState::empty();
-    }
-}
-
-template <typename T>
-__global__ void correctAcceptedStatesAndLogits(T const* draftProbs, T* targetProbs, T** targetLogits,
-    int32_t const* numsDraftTokens, FinishedState* finished, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t maxDraftTokens, int32_t beamWidth, int32_t vocabSize)
-{
-    auto const bid = blockIdx.x;
-    auto const batchIdx = bid / beamWidth;
-    auto const beamIdx = bid % beamWidth;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
-    auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
-    auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
-
-    __shared__ int32_t numAcceptedTokens;
-    if (threadIdx.x == 0)
-    {
-        numAcceptedTokens = numDraftTokens;
-        bool cummulativeSkipDecoding = false;
-        for (int32_t ti = 0; ti < numDraftTokens + 1; ++ti)
-        {
-            auto& finishedState = finished[ti * maxBatchSize * beamWidth + batchSlotBeamWidth];
-            bool localSkipDecoding = finishedState.isSkipDecoding();
-            if (cummulativeSkipDecoding == false && localSkipDecoding == true)
-            {
-                numAcceptedTokens = ti;
-            }
-
-            finishedState = cummulativeSkipDecoding ? FinishedState::skipDecoding() : FinishedState::empty();
-            cummulativeSkipDecoding |= localSkipDecoding;
-        }
-    }
-    __syncthreads();
-
-    if (numAcceptedTokens < numDraftTokens)
-    {
-        auto const logitsIdx = (batchSlot * maxDraftTokens + numAcceptedTokens) * beamWidth * vocabSize;
-        auto const draftProbBatch = draftProbs + logitsIdx;
-        auto targetProbBatch = targetProbs + logitsIdx;
-        auto targetLogitsBatch = targetLogits[bid] + numAcceptedTokens * beamWidth * vocabSize;
-
-        float sumProbs = 0.f;
-        for (int32_t vIdx = threadIdx.x; vIdx < vocabSize; vIdx += blockDim.x)
-        {
-            auto const correctedProb = max(static_cast<float>(targetProbBatch[vIdx] - draftProbBatch[vIdx]), 0.f);
-            sumProbs += correctedProb;
-            targetProbBatch[vIdx] = correctedProb;
-        }
-
-        __shared__ float sumProbsShared;
-        sumProbs = blockReduceSum<float>((float) sumProbs);
-        if (threadIdx.x == 0)
-        {
-            sumProbsShared = max(sumProbs, 1e-6f);
-        }
-        __syncthreads();
-
-        for (int32_t vIdx = threadIdx.x; vIdx < vocabSize; vIdx += blockDim.x)
-        {
-            auto const correctedNormProb = static_cast<float>(targetProbBatch[vIdx]) / sumProbsShared;
-            targetLogitsBatch[vIdx] = __logf(correctedNormProb / (1.f - correctedNormProb));
-        }
-    }
-}
-
-template <typename T>
-void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
-    int32_t const* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int32_t const* batchSlots,
-    int32_t batchSize, int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded,
-    int32_t maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream)
-{
-    TLLM_CHECK(beamWidth == 1);
-    {
-        invokeAddBiasSoftMax(draftLogits, (T**) (nullptr), draftProbs, (T*) (nullptr), nullptr, finished, batchSlots,
-            batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
-        invokeAddBiasSoftMax((T*) (nullptr), targetLogits, targetProbs, (T*) (nullptr), nullptr, finished, batchSlots,
-            batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
-    }
-    {
-        dim3 block(1024);
-        dim3 grid(batchSize * beamWidth, maxDraftTokens);
-        acceptDraftTokensByLogitsKernel<<<grid, block, 0, stream>>>(draftProbs, targetProbs, numsDraftTokens, finished,
-            curandState, batchSlots, batchSize, maxBatchSize, maxDraftTokens, beamWidth, vocabSizePadded,
-            randomThreshold, constantThreshold);
-    }
-    {
-        dim3 block(1024);
-        dim3 grid(batchSize * beamWidth);
-        correctAcceptedStatesAndLogits<<<grid, block, 0, stream>>>(draftProbs, targetProbs, targetLogits,
-            numsDraftTokens, finished, batchSlots, batchSize, maxBatchSize, maxDraftTokens, beamWidth, vocabSizePadded);
-    }
-}
-
-template void acceptDraftTokensByLogits(float* draftLogits, float** targetLogits, float* draftProbs, float* targetProbs,
-    int32_t const* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int32_t const* batchSlots,
-    int32_t batchSize, int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded,
-    int32_t maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
-template void acceptDraftTokensByLogits(half* draftLogits, half** targetLogits, half* draftProbs, half* targetProbs,
-    int32_t const* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int32_t const* batchSlots,
-    int32_t batchSize, int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded,
-    int32_t maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
-
-__device__ __forceinline__ int4 reduceMaxInt4(int4 const& a, int4 const& b)
-{
-    return a.x >= b.x ? a : b;
-}
-
-template <typename T, SizeType BLOCK_SIZE>
-__global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* targetIds,
-    SizeType* sequenceLengths, FinishedState* finishedFinal, SizeType const* batchSlots, SizeType const* paths,
-    TokenIdType const* endIds, T const* medusaLogits, T const** logitsPtrs, SizeType batchSize, SizeType vocabSize,
-    SizeType maxBatchSize, SizeType maxDraftSeqLen, SizeType maxTargetSeqLen, SizeType maxNumHeads,
-    SizeType maxTokensPerStep)
-{
-    auto const batchIdx = static_cast<SizeType>(blockIdx.x);
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
-    auto& inputLength = sequenceLengths[batchSlot];
-    auto const endId = endIds[batchSlot];
-    auto const maxNumDraftTokens = maxNumHeads + 1;
-
-    int4 partialMax{-1, -1, 0, 0};
-    // Go over different paths and construct implicit sequences
-    for (auto pathIdx = static_cast<SizeType>(threadIdx.x); pathIdx < maxTokensPerStep;
-         pathIdx += static_cast<SizeType>(blockDim.x))
-    {
-        auto acceptedLength = maxNumDraftTokens;
-        auto const pathOffset = flat_index3(batchSlot, pathIdx, 0, maxTokensPerStep, maxNumDraftTokens);
-        bool hasEnd = false;
-        // Go along the path
-        for (SizeType ti = 0; ti < maxNumDraftTokens; ++ti)
-        {
-            auto const tokenId = paths[pathOffset + ti];
-            // Break if path terminates
-            if (tokenId == -1)
-            {
-                acceptedLength = ti;
-                break;
-            }
-            auto const targetTokenIdx = batchSlot * maxTargetSeqLen + tokenId;
-            auto const draftTokenIdx = batchSlot * maxDraftSeqLen + inputLength + tokenId;
-            auto const draftToken = outputIds[draftTokenIdx];
-            auto const targetToken = targetIds[targetTokenIdx];
-
-            // Check if draft tokens are the same as target tokens
-            bool const accepted = draftToken == targetToken;
-            hasEnd = targetToken == endId;
-            if (!accepted || hasEnd)
-            {
-                acceptedLength = hasEnd ? ti : ti + 1;
-                break;
-            }
-        }
-        // Get longest path of the thread
-        if (partialMax.x < acceptedLength)
-        {
-            partialMax.x = acceptedLength;
-            partialMax.y = pathIdx;
-            partialMax.z = hasEnd;
-        }
-    }
-
-    // Get the longest path of the block (request)
-    typedef cub::BlockReduce<int4, BLOCK_SIZE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage tempStorage;
-    int4 total = BlockReduce(tempStorage).Reduce(partialMax, reduceMaxInt4);
-
-    __shared__ int4 totalShared;
-    if (threadIdx.x == 0)
-    {
-        totalShared = total;
-    }
-
-    __syncthreads();
-
-    auto const acceptedLength = totalShared.x;
-    auto const bestPathIdx = totalShared.y;
-    auto const pathOffset = flat_index3(batchSlot, bestPathIdx, 0, maxTokensPerStep, maxNumDraftTokens);
-    for (auto ti = static_cast<SizeType>(threadIdx.x); ti < acceptedLength; ti += static_cast<SizeType>(blockDim.x))
-    {
-        auto const tokenId = paths[pathOffset + ti];
-        auto const targetSrcTokenIdx = batchSlot * maxTargetSeqLen + tokenId;
-        auto const draftDstTokenIdx = batchSlot * maxDraftSeqLen + inputLength + ti;
-        auto const targetToken = targetIds[targetSrcTokenIdx];
-        // Copy accepted tokens to the sequence with draft tokens (outputIds === outputIds)
-        outputIds[draftDstTokenIdx] = targetToken;
-    }
-
-    __syncthreads();
-
-    // Leading thread reconstructs winning path and sets new data
-    if (threadIdx.x == 0)
-    {
-        auto const hasEnd = totalShared.z;
-        // Set end condition
-        if (hasEnd)
-        {
-            finishedFinal[batchSlot].setFinishedEOS();
-        }
-        // Make correction to the sequence length
-        inputLength += acceptedLength;
-    }
-
-    // Prepare logits pointers to respective logits from Medusa Heads for the all-top-K sampling kernel
-    for (auto hi = static_cast<SizeType>(threadIdx.x); hi < maxNumHeads; hi += static_cast<SizeType>(blockDim.x))
-    {
-        logitsPtrs[batchIdx * maxNumHeads + hi]
-            = medusaLogits + flat_index4(hi, batchIdx, acceptedLength, 0, maxBatchSize, maxTokensPerStep, vocabSize);
-    }
-}
-
-template <typename T>
-void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* targetIds, SizeType* sequenceLengths,
-    FinishedState* finishedFinal, SizeType const* batchSlots, SizeType const* paths, TokenIdType const* endIds,
-    T const* medusaLogits, T const** logitsPtrs, SizeType batchSize, SizeType vocabSize, SizeType maxBatchSize,
-    SizeType maxDraftSeqLen, SizeType maxTargetSeqLen, SizeType maxNumHeads, SizeType maxTokensPerStep,
-    cudaStream_t stream)
-{
-    constexpr SizeType BLOCK_SIZE = 256;
-    dim3 block(BLOCK_SIZE);
-    dim3 grid(batchSize);
-    acceptDraftTokensByIdsWithPaths<T, BLOCK_SIZE><<<grid, block, 0, stream>>>(outputIds, targetIds, sequenceLengths,
-        finishedFinal, batchSlots, paths, endIds, medusaLogits, logitsPtrs, batchSize, vocabSize, maxBatchSize,
-        maxDraftSeqLen, maxTargetSeqLen, maxNumHeads, maxTokensPerStep);
-}
-
-template void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* targetIds,
-    SizeType* sequenceLengths, FinishedState* finishedFinal, SizeType const* batchSlots, SizeType const* paths,
-    TokenIdType const* endIds, float const* medusaLogits, float const** logitsPtrs, SizeType batchSize,
-    SizeType vocabSize, SizeType maxBatchSize, SizeType maxDraftSeqLen, SizeType maxTargetSeqLen, SizeType maxNumHeads,
-    SizeType maxTokensPerStep, cudaStream_t stream);
-template void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdType const* targetIds,
-    SizeType* sequenceLengths, FinishedState* finishedFinal, SizeType const* batchSlots, SizeType const* paths,
-    TokenIdType const* endIds, half const* medusaLogits, half const** logitsPtrs, SizeType batchSize,
-    SizeType vocabSize, SizeType maxBatchSize, int32_t maxDraftSeqLen, SizeType maxTargetSeqLen, SizeType maxNumHeads,
-    SizeType maxTokensPerStep, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

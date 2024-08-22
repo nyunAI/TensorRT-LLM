@@ -1,9 +1,10 @@
 from enum import Enum, auto
 
+import numpy as np
 import torch
 
-from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.quantization.mode import QuantMode
+from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
+from tensorrt_llm.quantization import QuantMode
 
 from ..plugin_node import PluginNode
 from ..sharding_strategy import StrategiesVector
@@ -14,6 +15,7 @@ class IdxEntry(Enum):
     QKV_TENSOR = auto()
     K_TENSOR = auto()
     V_TENSOR = auto()
+    CONTEXT_FMHA_CUSTOM_MASK = auto()
     SEQUENCE_LENGTH = auto()
     HOST_PAST_KEY_VALUE_LENGTHS = auto()
     HOST_MAX_ATTENTION_WINDOW = auto()
@@ -21,11 +23,15 @@ class IdxEntry(Enum):
     CONTEXT_LENGTHS = auto()
     CACHE_INDIR = auto()
     REQUEST_TYPES = auto()
-    KV_CACHE_BLOCK_POINTERS = auto()
-    HOST_KV_CACHE_BLOCK_POINTERS = auto()
+    KV_CACHE_BLOCK_OFFSETS = auto()
+    HOST_KV_CACHE_BLOCK_OFFSETS = auto()
+    HOST_KV_CACHE_POOL_POINTERS = auto()
     PAST_KEY_VALUE = auto()
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
+    ATTENTION_OUTPUT_QUANTIZATION_SCALE = auto()
+    ROTARY_INV_FREQ = auto()
+    ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
     RELATIVE_ATTENTION_BIAS = auto()
     CROSS_QKV = auto()
@@ -33,8 +39,10 @@ class IdxEntry(Enum):
     ENCODER_INPUT_LENGTH = auto()
     HOST_CONTEXT_LENGTH = auto()
     QKV_BIAS_TENSOR = auto()
-    MEDUSA_PACKED_MASK = auto()
-    MEDUSA_POSITION_OFFSETS = auto()
+    SPEC_DECODING_PACKED_MASK = auto()
+    SPEC_DECODING_POSITION_OFFSETS = auto()
+    SPEC_DECODING_GENERATION_LENGTHS = auto()
+    HOST_RUNTIME_PERF_KNOBS = auto()
 
 
 class IdxEntryParser:
@@ -43,6 +51,10 @@ class IdxEntryParser:
         self.num_kv_heads = plugin_info.pfc_as_list['num_kv_heads'][0]
         self.unfuse_qkv_gemm = bool(
             plugin_info.pfc_as_list['unfuse_qkv_gemm'][0])
+        self.use_fp8_context_fmha = bool(
+            plugin_info.pfc_as_list['use_fp8_context_fmha'][0])
+        self.mask_type = AttentionMaskType(
+            plugin_info.pfc_as_list['mask_type'][0])
         self.use_cache = bool(plugin_info.pfc_as_list['use_cache'][0])
         self.paged_kv_cache = bool(plugin_info.pfc_as_list['paged_kv_cache'][0])
         self.do_cross_attention = bool(
@@ -55,8 +67,8 @@ class IdxEntryParser:
             plugin_info.pfc_as_list['kv_cache_quant_mode'][0])
         self.position_embedding_type = PositionEmbeddingType(
             plugin_info.pfc_as_list['position_embedding_type'][0])
-        self.is_medusa_enabled = bool(
-            plugin_info.pfc_as_list['is_medusa_enabled'][0])
+        self.is_spec_decoding_enabled = bool(
+            plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
         self.init_entry_to_index()
 
     # WARNING: Must in sync with GPTAttentionPlugin::isEntryUsed in cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp
@@ -67,6 +79,8 @@ class IdxEntryParser:
             return self.unfuse_qkv_gemm
         elif entry == IdxEntry.V_TENSOR:
             return self.unfuse_qkv_gemm
+        elif entry == IdxEntry.CONTEXT_FMHA_CUSTOM_MASK:
+            return self.mask_type == AttentionMaskType.custom_mask
         elif entry == IdxEntry.SEQUENCE_LENGTH:
             return self.use_cache
         elif entry == IdxEntry.HOST_PAST_KEY_VALUE_LENGTHS:
@@ -81,9 +95,11 @@ class IdxEntryParser:
             return self.use_cache
         elif entry == IdxEntry.REQUEST_TYPES:
             return True
-        elif entry == IdxEntry.KV_CACHE_BLOCK_POINTERS:
+        elif entry == IdxEntry.KV_CACHE_BLOCK_OFFSETS:
             return self.use_cache and self.paged_kv_cache
-        elif entry == IdxEntry.HOST_KV_CACHE_BLOCK_POINTERS:
+        elif entry == IdxEntry.HOST_KV_CACHE_BLOCK_OFFSETS:
+            return self.use_cache and self.paged_kv_cache
+        elif entry == IdxEntry.HOST_KV_CACHE_POOL_POINTERS:
             return self.use_cache and self.paged_kv_cache
         elif entry == IdxEntry.PAST_KEY_VALUE:
             return self.use_cache and not self.paged_kv_cache
@@ -93,6 +109,13 @@ class IdxEntryParser:
         elif entry == IdxEntry.KV_CACHE_DEQUANTIZATION_SCALE:
             return self.use_cache and self.kv_cache_quant_mode.has_kv_cache_quant(
             )
+        elif entry == IdxEntry.ATTENTION_OUTPUT_QUANTIZATION_SCALE:
+            return self.use_fp8_context_fmha and self.kv_cache_quant_mode.has_fp8_qdp(
+            )
+        elif entry == IdxEntry.ROTARY_INV_FREQ:
+            return self.position_embedding_type.is_rope()
+        elif entry == IdxEntry.ROTARY_COS_SIN:
+            return self.position_embedding_type.is_rope()
         elif entry == IdxEntry.ALIBI_SLOPES:
             return self.position_embedding_type.is_alibi()
         elif entry == IdxEntry.RELATIVE_ATTENTION_BIAS:
@@ -107,10 +130,14 @@ class IdxEntryParser:
             return self.remove_input_padding
         elif entry == IdxEntry.QKV_BIAS_TENSOR:
             return self.qkv_bias_enabled
-        elif entry == IdxEntry.MEDUSA_PACKED_MASK:
-            return self.is_medusa_enabled
-        elif entry == IdxEntry.MEDUSA_POSITION_OFFSETS:
-            return self.is_medusa_enabled
+        elif entry == IdxEntry.SPEC_DECODING_PACKED_MASK:
+            return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.SPEC_DECODING_POSITION_OFFSETS:
+            return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
+            return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.HOST_RUNTIME_PERF_KNOBS:
+            return True
         else:
             return False
 
@@ -148,10 +175,10 @@ class GPTAttentionPlugin(PluginNode):
         self.parser = IdxEntryParser(self.plugin_info)
         assert self.num_inputs == len(
             self.parser.entry_to_index
-        ), f'the plugin inputs number {self.num_inputs} is invalid'
+        ), f'the number of plugin inputs ({self.num_inputs}) is invalid'
         assert self.num_outputs == (
-            2 if self.parser.is_entry_used(IdxEntry.PAST_KEY_VALUE) else
-            1), f'the plugin outputs number {self.num_outputs} has been changed'
+            2 if self.parser.is_entry_used(IdxEntry.PAST_KEY_VALUE) else 1
+        ), f'the number of plugin outputs ({self.num_outputs}) has been changed'
 
     def _tp_strategy(self, device_mesh):
         strategies_vector = StrategiesVector(self)
@@ -360,8 +387,8 @@ class GPTAttentionPlugin(PluginNode):
         num_kv_heads = self.plugin_info.pfc_as_ndarray["num_kv_heads"].copy()
         tp_size = self.plugin_info.pfc_as_ndarray["tp_size"].copy()
         tp_rank = self.plugin_info.pfc_as_ndarray["tp_rank"].copy()
-        num_kv_heads = num_kv_heads // kv_partition
-        num_heads = num_heads // partition
+        num_kv_heads = np.maximum(num_kv_heads // kv_partition, 1)
+        num_heads = np.maximum(num_heads // partition, 1)
         tp_size[0] = partition
         tp_rank[0] = 0
 

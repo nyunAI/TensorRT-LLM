@@ -1,41 +1,45 @@
 import os
 import sys
-import tempfile
 
-from tensorrt_llm.hlapi.llm import LLM, ModelConfig
+from tensorrt_llm.hlapi.llm import LLM, SamplingParams
+from tensorrt_llm.hlapi.llm_utils import QuantAlgo, QuantConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere, skip_pre_hopper
 
-llama_model_path = str(llm_models_root() / "llama-models/llama-7b-hf")
+try:
+    from .test_llm import llama_model_path
+except ImportError:
+    from test_llm import llama_model_path
 
 
 @skip_pre_ampere
 def test_llm_int4_awq_quantization():
-    config = ModelConfig(llama_model_path)
-    config.quant_config.init_from_description(quantize_weights=True,
-                                              use_int4_weights=True,
-                                              per_group=True)
-    config.quant_config.quantize_lm_head = True
-    assert config.quant_config.has_any_quant()
+    quant_config = QuantConfig()
+    quant_config.quant_algo = QuantAlgo.W4A16_AWQ
+    assert quant_config.quant_mode.has_any_quant()
 
-    llm = LLM(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
+    llm = LLM(llama_model_path, quant_config=quant_config)
+
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
+        print(output)
+        assert output.outputs[0].text == "D E F G H I"
 
 
 @skip_pre_hopper
 def test_llm_fp8_quantization():
-    config = ModelConfig(llama_model_path)
-    config.quant_config.set_fp8_qdq()
-    config.quant_config.set_fp8_kv_cache()
+    quant_config = QuantConfig()
+    quant_config.quant_algo = QuantAlgo.FP8
+    quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
-    assert config.quant_config.has_any_quant()
+    assert quant_config.quant_mode.has_any_quant()
 
-    llm = LLM(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
+    llm = LLM(llama_model_path, quant_config=quant_config)
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
+        print(output)
+        assert output.outputs[0].text == "D E F G H I"
 
 
 if __name__ == "__main__":

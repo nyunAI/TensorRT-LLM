@@ -29,29 +29,34 @@ namespace tensorrt_llm::runtime
 class MemoryCounters
 {
 public:
-    using SizeType = std::size_t;
+    using SizeType32 = std::size_t;
     using DiffType = std::ptrdiff_t;
 
     MemoryCounters() = default;
 
-    [[nodiscard]] SizeType getGpu() const
+    [[nodiscard]] SizeType32 getGpu() const
     {
         return mGpu;
     }
 
-    [[nodiscard]] SizeType getCpu() const
+    [[nodiscard]] SizeType32 getCpu() const
     {
         return mCpu;
     }
 
-    [[nodiscard]] SizeType getPinned() const
+    [[nodiscard]] SizeType32 getPinned() const
     {
         return mPinned;
     }
 
-    [[nodiscard]] SizeType getUVM() const
+    [[nodiscard]] SizeType32 getUVM() const
     {
         return mUVM;
+    }
+
+    [[nodiscard]] SizeType32 getPinnedPool() const
+    {
+        return mPinnedPool;
     }
 
     [[nodiscard]] DiffType getGpuDiff() const
@@ -74,8 +79,13 @@ public:
         return mUVMDiff;
     }
 
+    [[nodiscard]] DiffType getPinnedPoolDiff() const
+    {
+        return mPinnedPoolDiff;
+    }
+
     template <MemoryType T>
-    void allocate(SizeType size)
+    void allocate(SizeType32 size)
     {
         auto const sizeDiff = static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
@@ -98,16 +108,21 @@ public:
             mUVM += size;
             mUVMDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool += size;
+            mPinnedPoolDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
         }
     }
 
-    void allocate(MemoryType memoryType, SizeType size);
+    void allocate(MemoryType memoryType, SizeType32 size);
 
     template <MemoryType T>
-    void deallocate(SizeType size)
+    void deallocate(SizeType32 size)
     {
         auto const sizeDiff = -static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
@@ -130,25 +145,30 @@ public:
             mUVM -= size;
             mUVMDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool -= size;
+            mPinnedPoolDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
         }
     }
 
-    void deallocate(MemoryType memoryType, SizeType size);
+    void deallocate(MemoryType memoryType, SizeType32 size);
 
     static MemoryCounters& getInstance();
 
-    static std::string bytesToString(SizeType bytes, int precision = 2);
+    static std::string bytesToString(SizeType32 bytes, int precision = 2);
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
     [[nodiscard]] std::string toString() const;
 
 private:
-    std::atomic<SizeType> mGpu{}, mCpu{}, mPinned{}, mUVM{};
-    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
+    std::atomic<SizeType32> mGpu{}, mCpu{}, mPinned{}, mUVM{}, mPinnedPool{};
+    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{}, mPinnedPoolDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

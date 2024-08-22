@@ -41,6 +41,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.h"
 
@@ -66,18 +67,11 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-#ifdef COMPILE_HOPPER_MIXED_INPUT_GEMMS
+#ifdef COMPILE_HOPPER_TMA_GEMMS
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
-// For FAST_BUILD, only instantiate kernels with 128x128x128B with 1x1x1 cluster shape.
-#ifdef FAST_BUILD
-    constexpr int TILE_K = 128 * 8 / cutlass::sizeof_bits<CutlassActivationType>::value;
-    using SupportedCtaShape = Shape<_128, _128, cute::Int<TILE_K>>;
-    using SupportedCgaShape = Shape<_1, _1, _1>;
-
-    if constexpr (cute::is_same_v<SupportedCtaShape, CTAShape> && cute::is_same_v<SupportedCgaShape, ClusterShape>)
+    if constexpr (!should_filter_sm90_gemm_problem_shape_v<CTAShape, ClusterShape, ActivationType>)
     {
-#endif // FAST_BUILD
         using CutlassWeightType__ = typename TllmToCutlassTypeAdapter<WeightType>::type;
         // We need to remap this since SM90 uses a different layout for the weight matrix.
         using CutlassWeightType_ = std::conditional_t<std::is_same_v<CutlassWeightType__, cutlass::uint4b_t>,
@@ -278,19 +272,23 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
                 = "Failed to run cutlass fpA_intB gemm. Error: " + std::string(cutlassGetStatusString(run_status));
             throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] " + err_msg);
         }
-#ifdef FAST_BUILD
     }
     else
     {
-        throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] Config not compiled with FAST_BUILD.");
-    }
-#endif // FAST_BUILD
+        std::stringstream ss;
+        ss << "[TensorRT-LLm Error][fpA_intB Runner] Config (" << (int64_t) cute::size<0>(CTAShape{}) << ","
+           << (int64_t) cute::size<1>(CTAShape{}) << "," << (int64_t) cute::size<2>(CTAShape{}) << ") ("
+           << (int64_t) cute::size<0>(ClusterShape{}) << "," << (int64_t) cute::size<1>(ClusterShape{}) << ","
+           << (int64_t) cute::size<2>(ClusterShape{}) << ") not compiled with FAST_BUILD.";
 
-#else  // COMPILE_HOPPER_MIXED_INPUT_GEMMS
+        throw std::runtime_error(ss.str());
+    }
+
+#else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
         "[TensorRT-LLm Error][fpA_intB Runner] Please recompile with support for hopper by passing 90-real as an arch "
         "to build_wheel.py.");
-#endif // COMPILE_HOPPER_MIXED_INPUT_GEMMS
+#endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
 } // namespace cutlass_kernels

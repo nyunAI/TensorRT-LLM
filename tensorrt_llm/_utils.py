@@ -13,27 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import gc
+import inspect
 import json
 import math
 import struct
-import tarfile
 import weakref
+from dataclasses import asdict
+from enum import EnumMeta
 from functools import partial
-from pathlib import Path, PosixPath
 from typing import Any, Dict, List, Optional, Union
-from .logger import logger
 
 import numpy as np
-import yaml
 from packaging import version
+
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # isort: off
 import torch
 import tensorrt as trt
 # isort: on
-
-import os
-KOMPRESS_ENVIRON_DATASET_JSON_PATH = "KOMPRESS_ENVIRON_DATASET_JSON_PATH"
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -53,11 +52,11 @@ def torch_to_numpy(x: torch.Tensor):
 
 def numpy_to_torch(x):
     if x.dtype == np_bfloat16:
-        return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
+        return torch.from_numpy(x.view(np.int16)).view(torch.bfloat16)
     elif x.dtype == np_float8:
-        return torch.tensor(x.view(np.int8)).view(torch.float8_e4m3fn)
+        return torch.from_numpy(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
-        return torch.tensor(x)
+        return torch.from_numpy(x)
 
 
 def numpy_to_dtype(x, dtype: str):
@@ -73,12 +72,30 @@ def numpy_to_dtype(x, dtype: str):
 fp32_array = partial(np.array, dtype=np.float32)
 fp16_array = partial(np.array, dtype=np.float16)
 int32_array = partial(np.array, dtype=np.int32)
+int64_array = partial(np.array, dtype=np.int64)
+bool_array = partial(np.array, dtype=np.bool_)
+
+
+def dims_array(x):
+    is_int64_dims = True
+    try:
+        trt.Dims([np.iinfo(np.int64).max])
+    except TypeError:
+        is_int64_dims = False
+    return int64_array(x) if is_int64_dims else int32_array(x)
 
 
 def bf16_array(x):
     x = torch.tensor(x, dtype=torch.bfloat16)
     x = torch_to_numpy(x)
     return x
+
+
+def numpy_array(data, trt_dtype):
+    # convenient wrapper due to numpy not support bf16 yet
+    if trt_dtype == trt.bfloat16:
+        return bf16_array(data)
+    return np.array(data, trt_dtype_to_np(trt_dtype))
 
 
 def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
@@ -95,14 +112,12 @@ def trt_version():
     return trt.__version__
 
 
-# TRT supports strongly_type in 9.1
-def support_strongly_type():
-    return version.parse(trt_version()) >= version.parse("9.1.0")
-
-
-# Preview change in TRT 10.0
-def preview_trt_version():
-    return version.parse(trt_version()).major > 9
+def trt_gte(major: int, minor: int = 0):
+    """
+    Check if TRT version is greater than or equal to major.minor
+    """
+    trt_ver = version.parse(trt_version())
+    return trt_ver.major >= major and trt_ver.minor >= minor
 
 
 def torch_version():
@@ -143,6 +158,13 @@ def str_dtype_to_torch(dtype):
     ret = _str_to_torch_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
+
+
+_torch_dtype_to_str_dict = {v: k for k, v in _str_to_torch_dtype_dict.items()}
+
+
+def torch_dtype_to_str(dtype):
+    return _torch_dtype_to_str_dict[dtype]
 
 
 _str_to_trt_dtype_dict = dict(float16=trt.float16,
@@ -265,6 +287,25 @@ def is_same_dtype(type_a: Union[str, trt.DataType],
     return type_a == type_b
 
 
+_torch_to_trt_dtype_dict = {
+    torch.float16: trt.float16,
+    torch.float32: trt.float32,
+    torch.int64: trt.int64,
+    torch.int32: trt.int32,
+    torch.int8: trt.int8,
+    torch.float8_e4m3fn: trt.fp8,
+    torch.qint8: trt.int8,
+    torch.bool: trt.bool,
+    torch.bfloat16: trt.bfloat16
+}
+
+
+def torch_dtype_to_trt(dtype):
+    ret = _torch_to_trt_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 def dim_to_trt_axes(dim):
     """Converts torch dim, or tuple of dims to a tensorrt axes bitmask"""
     if not isinstance(dim, tuple):
@@ -299,17 +340,21 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+# mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
+OMPI_COMM_TYPE_HOST = 9
+
+
 def mpi_comm():
     from mpi4py import MPI
     return MPI.COMM_WORLD
 
 
 def mpi_rank():
-    return mpi_comm().Get_rank()
+    return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def mpi_world_size():
-    return mpi_comm().Get_size()
+    return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_barrier():
@@ -354,21 +399,6 @@ def numpy_fp32_to_bf16(src):
     return dst.reshape(original_shape).view(np_bfloat16)
 
 
-def fromfile(dir_path, name, shape=None, dtype=None):
-    dtype = np_dtype if dtype is None else dtype
-    p = dir_path
-    if not isinstance(p, PosixPath):
-        p = Path(p)
-    p = p / name
-
-    if Path(p).exists():
-        t = np.fromfile(p, dtype=dtype)
-        if shape is not None:
-            t = t.reshape(shape)
-        return t
-    return None
-
-
 _extra_attrs_by_object: Dict[int, Dict[str, Any]] = {}
 
 
@@ -397,22 +427,6 @@ def has_extra_attr(obj, attr_name):
     return attr_name in _extra_attrs_by_object[id(obj)]
 
 
-def unpack_nemo_weights(nemo_archive_path):
-    with tarfile.open(nemo_archive_path) as tar:
-        try:
-            model_weights = tar.extractfile("model_weights.ckpt")
-            model_config = tar.extractfile("model_config.yaml")
-        except KeyError:
-            try:
-                model_weights = tar.extractfile("./model_weights.ckpt")
-                model_config = tar.extractfile("./model_config.yaml")
-            except KeyError:
-                err_str = "Both model_weights paths not found in the tar archive."
-                raise Exception(err_str)
-        return yaml.safe_load(model_config), torch.load(
-            model_weights, map_location=torch.device("cpu"))
-
-
 def set_obj_attrs(
     obj: torch.Tensor,
     ojb_attrs: Optional[Dict[str, Any]],
@@ -430,48 +444,68 @@ def set_obj_attrs(
         setattr(obj, key, value)
 
 
-def get_data_from_kompress():
-    """This method loads the Kompress dataset for quantisation use."""
+def get_init_params(obj, cls=None):
+    """
+    Get all parameters in object's __init__.
+    Use cls's __init__ as filter if cls provided.
+    """
+    names = None
+    if cls is not None:
+        names = set(list(inspect.signature(cls.__init__).parameters)[1:])
+    return {
+        name: getattr(obj, name)
+        for name in list(inspect.signature(obj.__class__.__init__).parameters)
+        [1:] if names is None or name in names
+    }
 
-    kompress_dataset_json_path = os.environ.get(KOMPRESS_ENVIRON_DATASET_JSON_PATH, None)
-    kompress_dataset_json_path = Path(kompress_dataset_json_path) if kompress_dataset_json_path else None
 
-    if not kompress_dataset_json_path:
-        logger.info(f"Could not load Kompress dataset. Env var `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` not found.")
-        return None
-    
-    from dataclasses import dataclass, field
-    from datasets import load_dataset, load_from_disk
-    @dataclass
-    class Dataset:
-        # adapted from Kompress
+def release_gc():
+    ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
+    This could be used when some states might be kept in memory even after the variables are deleted.
+    '''
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-        dataset_name_or_path: Optional[str] = field(default=None, metadata={
-            "help": "Name of the dataset."})
-        dataset_subset: Optional[str] = field(default=None, metadata={
-            "help": "Name of the dataset subset."})
-        text_column: Optional[str] = field(default="text", metadata={
-            "help": "Name of the text column(s). If multiple columns, separate by comma."})
-        split: Optional[str] = field(default="train", metadata={
-            "help": "Split of the dataset."})
-        format_string: Optional[str] = field(default=None, metadata={
-            "help": "Format of the dataset."})
 
-        new_text_column = "text"
+class DictConversion:
 
-        @classmethod
-        def from_json_file(cls, filepath: Path):
-            import json
-            with open(filepath, 'r') as file:
-                json_dict = json.load(file)
-            return cls(**json_dict)
-    
-        def load_caliberation_data(self):
-            ds = load_from_disk(self.dataset_name_or_path)
-            return ds[self.split][self.text_column]
-    
-    dataset_obj = Dataset.from_json_file(kompress_dataset_json_path)
-    logger.info(f"Loading Kompress dataset from `{KOMPRESS_ENVIRON_DATASET_JSON_PATH}` ...")
-    return dataset_obj
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]):
+        obj = cls()
+        fields = obj.__dataclass_fields__
+        for key, value in config.items():
+            assert hasattr(obj, key)
+            field_cls = fields[key].type
+            if (isinstance(field_cls, type)
+                    and issubclass(field_cls, DictConversion)
+                    and isinstance(value, dict)):
+                value = field_cls.from_dict(value)
+            setattr(obj, key, value)
+        return obj
 
-    
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_json_file(cls, file):
+        with open(file) as f:
+            return cls.from_dict(json.load(f))
+
+    def set_defaults(self, **kwargs):
+        for key, default in kwargs.items():
+            value = getattr(self, key)
+            if (value is None
+                    or (isinstance(value, (list, dict)) and len(value) == 0)):
+                setattr(self, key, default)
+
+
+class BaseEnumMeta(EnumMeta):
+
+    def __contains__(cls, item):
+        try:
+            cls(item)
+        except ValueError:
+            return False
+        return True

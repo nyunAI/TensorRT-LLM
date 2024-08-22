@@ -12,13 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional, Union
+
+from transformers import AutoModelForCausalLM
+
 from ..._utils import pad_vocab_size
-from ...functional import PositionEmbeddingType, Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
-                       ParallelLMHead)
+from ...functional import Tensor
+from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, LayerNorm)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              PretrainedConfig, QuantConfig)
+from .config import PhiConfig
+from .convert import load_weights_from_hf_model
 
 
 class PhiDecoderLayer(Module):
@@ -39,8 +46,8 @@ class PhiDecoderLayer(Module):
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
-            rotary_embedding_percentage=config.partial_rotary_factor,
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            rotary_embedding_percentage=config.rotary_pct,
+            position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
@@ -93,19 +100,9 @@ class PhiModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        mapping = config.mapping
-        use_parallel_embedding = False
-        embedding_sharding_dim = 0
-        self.use_prompt_tuning = config.use_prompt_tuning
-
-        self.vocab_embedding = Embedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            dtype=config.dtype,
-            tp_size=mapping.tp_size if use_parallel_embedding else 1,
-            tp_group=mapping.tp_group if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.rank)
+        self.vocab_embedding = Embedding(num_embeddings=config.vocab_size,
+                                         embedding_dim=config.hidden_size,
+                                         dtype=config.dtype)
 
         self.layers = DecoderLayerList(PhiDecoderLayer, config)
         self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
@@ -124,7 +121,7 @@ class PhiModel(Module):
         prompt_vocab_size=None,
     ):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
+                ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
 
         hidden_states = self.layers(
@@ -145,6 +142,9 @@ class PhiModel(Module):
 
 
 class PhiForCausalLM(DecoderModelForCausalLM):
+    config_class = PhiConfig
+
+    config_class = PhiConfig
 
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
@@ -152,21 +152,52 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        share_weight = None
-        if config.share_embedding_table:
-            share_weight = transformer.vocab_embedding.weight
-
-        lm_head = ParallelLMHead(config.hidden_size,
-                                 vocab_size_padded,
-                                 bias=True,
-                                 dtype=config.dtype,
-                                 tp_group=config.mapping.tp_group,
-                                 tp_size=config.mapping.tp_size,
-                                 gather_output=True,
-                                 share_weight=share_weight)
+        lm_head = ColumnLinear(config.hidden_size,
+                               vocab_size_padded,
+                               bias=True,
+                               dtype=config.dtype,
+                               tp_group=config.mapping.tp_group,
+                               tp_size=config.mapping.tp_size,
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
 
     def check_config(self, config):
         config.set_if_not_exist('partial_rotary_factor', 0.4)
         config.set_if_not_exist('rotary_base', 10000.0)
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        import transformers
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+        config = PhiConfig.from_hugging_face(hf_config_or_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+        if not use_preloading:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+
+        assert isinstance(hf_model, transformers.PreTrainedModel)
+
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        model = cls(config)
+        model.load(weights)
+        return model

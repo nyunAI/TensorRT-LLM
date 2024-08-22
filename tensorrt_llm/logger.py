@@ -41,6 +41,7 @@ class Logger(metaclass=Singleton):
     WARNING = '[W]'
     INFO = '[I]'
     VERBOSE = '[V]'
+    DEBUG = '[D]'
 
     def __init__(self):
         environ_severity = os.environ.get('TLLM_LOG_LEVEL')
@@ -55,7 +56,8 @@ class Logger(metaclass=Singleton):
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         logging.basicConfig(level=severity_map[min_severity][1],
-                            format="%(name)s - %(message)s",
+                            format='[%(asctime)s] %(message)s',
+                            datefmt='%m/%d/%Y-%H:%M:%S',
                             stream=sys.stdout)
         self._logger = logging.getLogger('TRT-LLM')
         self._polygraphy_logger = G_LOGGER
@@ -77,7 +79,7 @@ class Logger(metaclass=Singleton):
             return self._logger.warning
         elif severity == self.INFO:
             return self._logger.info
-        elif severity == self.VERBOSE:
+        elif severity == self.VERBOSE or severity == self.DEBUG:
             return self._logger.debug
         else:
             raise AttributeError(f'No such severity: {severity}')
@@ -87,7 +89,7 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, msg):
-        msg = f'[TRT-LLM] ' + msg
+        msg = f'[TRT-LLM] {severity} ' + msg
         self._func_wrapper(severity)(msg)
 
     def critical(self, msg):
@@ -131,6 +133,7 @@ severity_map = {
     'warning': [trt.Logger.WARNING, logging.WARNING],
     'info': [trt.Logger.INFO, logging.INFO],
     'verbose': [trt.Logger.VERBOSE, logging.DEBUG],
+    'debug': [trt.Logger.VERBOSE, logging.DEBUG],
 }
 
 if G_LOGGER is not None:
@@ -140,6 +143,7 @@ if G_LOGGER is not None:
         'warning': G_LOGGER.WARNING,
         'info': G_LOGGER.INFO,
         'verbose': G_LOGGER.SUPER_VERBOSE,
+        'debug': G_LOGGER.SUPER_VERBOSE,
     }
     for key, value in g_logger_severity_map.items():
         severity_map[key].append(value)

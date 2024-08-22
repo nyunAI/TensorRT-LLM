@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "smoothQuantGemmPlugin.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/int8SQ.h"
 #include <numeric>
 
 using namespace nvinfer1;
@@ -50,7 +51,7 @@ void SmoothQuantGemmPluginProfiler::runTactic(int m, int n, int k, SmoothQuantGe
         aTmp, bTmp, mQuantMode, alphaColTmp, alphaRowTmp, cTmp, m, n, k, tactic, workspaceTmp, wsSize, stream);
 }
 
-void SmoothQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void SmoothQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(int8_t),                                  // A
@@ -118,11 +119,12 @@ void SmoothQuantGemmPlugin::init(nvinfer1::DataType type)
     {
         m_sqGemmRunner = std::make_shared<CutlassInt8GemmRunner<int32_t>>();
     }
-    else
+#ifdef ENABLE_BF16
+    else if (mType == nvinfer1::DataType::kBF16)
     {
-        // TODO: add bf16 support
-        TLLM_THROW("Support for bf16 is missing");
+        m_sqGemmRunner = std::make_shared<CutlassInt8GemmRunner<__nv_bfloat16>>();
     }
+#endif
 
     mPluginProfiler->setQuantMode(mQuantMode);
 
@@ -228,20 +230,48 @@ int SmoothQuantGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     //     scale_channels [1, N] if has_per_channel_scaling else [1, 1]
     // outputs
     //     mat [M(*), N]
-    int m = 1;
+    int64_t m64 = 1;
     for (int ii = 0; ii < inputDesc[0].dims.nbDims - 1; ++ii)
     {
-        m *= inputDesc[0].dims.d[ii];
+        m64 *= inputDesc[0].dims.d[ii];
     }
-    int const n = inputDesc[1].dims.d[0];
-    int const k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+    int const m = TLLM_INT32_CAST(m64);
+    int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[0]);
+    int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
     int const wsSize = m_sqGemmRunner->getWorkspaceSize(m, n, k);
-
-    auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-    TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
-    m_sqGemmRunner->gemm(reinterpret_cast<int8_t const*>(inputs[0]), reinterpret_cast<int8_t const*>(inputs[1]),
-        mQuantMode, reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<float const*>(inputs[2]),
-        reinterpret_cast<void*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize, stream);
+    if (m <= 4)
+    {
+        tensorrt_llm::kernels::smooth_quant::Params params(reinterpret_cast<int8_t const*>(inputs[0]),
+            reinterpret_cast<int8_t const*>(inputs[1]), reinterpret_cast<float const*>(inputs[2]),
+            reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<void*>(outputs[0]), m, n, k, mQuantMode);
+        if (mType == nvinfer1::DataType::kHALF)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<half>(params, stream);
+        }
+        else if (mType == nvinfer1::DataType::kFLOAT)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<float>(params, stream);
+        }
+#ifdef ENABLE_BF16
+        else if (mType == nvinfer1::DataType::kBF16)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<__nv_bfloat16>(params, stream);
+        }
+#endif
+        else if (mType == nvinfer1::DataType::kINT32)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<int>(params, stream);
+        }
+    }
+    else
+    {
+        auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+        TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
+        m_sqGemmRunner->gemm(reinterpret_cast<int8_t const*>(inputs[0]), reinterpret_cast<int8_t const*>(inputs[1]),
+            mQuantMode, reinterpret_cast<float const*>(inputs[3]), reinterpret_cast<float const*>(inputs[2]),
+            reinterpret_cast<void*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize,
+            stream);
+    }
 
     return 0;
 }

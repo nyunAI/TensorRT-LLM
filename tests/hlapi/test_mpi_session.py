@@ -1,41 +1,41 @@
-from dataclasses import dataclass
-from typing import List
+import os
+import subprocess  # nosec B404
 
-from tensorrt_llm.hlapi.mpi_session import SocketListener
+import pytest
 
-
-@dataclass
-class ComplexData:
-    a: str
-    b: int
-    c: List[int]
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.hlapi.mpi_session import MPINodeState
 
 
-def test_SocketServer():
+def task0():
+    if MPINodeState.state is None:
+        MPINodeState.state = 0
+    MPINodeState.state += 1
+    return MPINodeState.state
 
-    messages = [
-        "hello",  # str
-        123,  # int
-        ComplexData("hello", 123, [1, 2, 3])  # complex
-    ]
 
-    offset = 0
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_session_basic():
+    from tensorrt_llm.hlapi.mpi_session import MpiPoolSession
 
-    def callback(data):
-        nonlocal offset
-        print('get data', data)
-        assert data == messages[offset]
-        offset += 1
+    n_workers = 4
+    executor = MpiPoolSession(n_workers)
+    results = executor.submit_sync(task0)
+    assert results == [1, 1, 1, 1], results
 
-    server = SocketListener(callback=callback)
+    results = executor.submit_sync(task0)
+    assert results == [2, 2, 2, 2], results
 
-    client = server.get_client()
 
-    for data in messages:
-        client.send(data)
-
-    server.shutdown()
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_session_multi_node():
+    nworkers = 4
+    test_case_file = os.path.join(os.path.dirname(__file__), "mpi_test_task.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} python {test_case_file}"
+    subprocess.run(command, shell=True, check=True,
+                   env=os.environ)  # nosec B603
 
 
 if __name__ == '__main__':
-    test_SocketServer()
+    test_mpi_session_basic()
+    test_mpi_session_multi_node()

@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -50,8 +51,10 @@ std::string getNumpyTypeDesc(nvinfer1::DataType type)
     return type_map.count(type) > 0 ? type_map.at(type) : "x";
 }
 
-nvinfer1::DataType typeFromNumpyDesc(std::string type)
+nvinfer1::DataType typeFromNumpyDesc(std::string const& type)
 {
+    TLLM_LOG_DEBUG("numpy type: %s", type.c_str());
+
     using dt = nvinfer1::DataType;
     static const std::unordered_map<std::string, dt> type_map{{"?", dt::kBOOL}, {"u1", dt::kUINT8}, {"i1", dt::kINT8},
         {"i4", dt::kINT32}, {"i8", dt::kINT64}, {"f2", dt::kHALF}, {"f4", dt::kFLOAT}};
@@ -76,6 +79,8 @@ void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
     uint8_t npy_minor = 0;
     n_elems = fread((void*) &npy_major, sizeof(uint8_t), 1, f_ptr);
     n_elems += fread((void*) &npy_minor, sizeof(uint8_t), 1, f_ptr);
+
+    TLLM_LOG_DEBUG("npy format version: %d.%d", npy_major, npy_minor);
 
     if (npy_major == 1)
     {
@@ -109,11 +114,18 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     std::string header(header_c, header_len);
     free(header_c);
 
+    TLLM_LOG_DEBUG("npy header: %s", header.c_str());
+
     size_t start, end;
     start = header.find("'descr'") + 7;
     start = header.find("'", start);
+    // ignore byte order specifier
+    if (header[start + 1] == '<' || header[start + 1] == '>' || header[start + 1] == '=')
+    {
+        ++start;
+    }
     end = header.find("'", start + 1);
-    type = typeFromNumpyDesc(header.substr(start + 2, end - start - 2));
+    type = typeFromNumpyDesc(header.substr(start + 1, end - start - 1));
 
     start = header.find("'fortran_order'") + 15;
     start = header.find(":", start);
@@ -144,7 +156,8 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
 }
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, std::string const& npyFile, const MemoryType where)
+[[nodiscard]] ITensor::UniquePtr loadNpy(
+    BufferManager const& manager, std::string const& npyFile, const MemoryType where)
 {
     FILE* f_ptr = fopen(npyFile.c_str(), "rb");
     if (f_ptr == nullptr)
@@ -162,7 +175,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     dims.nbDims = shape.size();
     std::copy(shape.begin(), shape.end(), dims.d);
 
-    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNED : where;
+    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNEDPOOL : where;
     auto tensor = manager.allocate(readWhere, dims, type);
     auto data = tensor->data();
     auto eltSize = BufferDataType(tensor->getDataType()).getSize();
@@ -180,7 +193,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     return tensor;
 }
 
-void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& filename)
+void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename)
 {
     // Save tensor to NPY 1.0 format (see https://numpy.org/neps/nep-0001-npy-format.html)
     auto const tensorSize = tensor.getSize();
@@ -203,7 +216,7 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& f
 
     if (where == MemoryType::kGPU)
     {
-        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNED);
+        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNEDPOOL);
         manager.getStream().synchronize();
         saveNpy(manager, *tensorHost, filename);
         return;
@@ -226,14 +239,14 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& f
         }
     }
     header_stream << ")}";
-    int base_length = 6 + 4 + header_stream.str().size();
+    int base_length = 6 + 4 + static_cast<int>(header_stream.str().size());
     int pad_length = 16 * ((base_length + 1 + 15) / 16); // Take ceiling of base_length + 1 (for '\n' ending)
     for (int i = 0; i < pad_length - base_length; ++i)
     {
         header_stream << ((i == pad_length - base_length - 1) ? "\n" : "\x20");
     }
     std::string header = header_stream.str();
-    const uint16_t header_len = header.size();
+    auto const header_len = static_cast<uint16_t>(header.size());
 
     FILE* f_ptr = fopen(filename.c_str(), "wb");
     TLLM_CHECK_WITH_INFO(f_ptr != nullptr, tc::fmtstr("Unable to open %s for writing.\n", filename.c_str()));

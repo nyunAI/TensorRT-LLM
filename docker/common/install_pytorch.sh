@@ -4,8 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-01.html#rel-24-01
-TORCH_VERSION="2.1.2"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07
+TORCH_VERSION="2.4.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -34,6 +34,13 @@ restore_environment() {
 }
 
 install_from_source() {
+    if [[ $SYSTEM_ID == *"centos"* ]]; then
+	VERSION_ID=$(grep -oP '(?<=^VERSION_ID=).+' /etc/os-release | tr -d '"')
+	if [[ $VERSION_ID == "7" ]]; then
+            echo "Installation from PyTorch source codes cannot be supported..."
+	    exit 1
+	fi
+    fi
     prepare_environment $1
     export _GLIBCXX_USE_CXX11_ABI=$1
     export TORCH_CUDA_ARCH_LIST="8.0;9.0"

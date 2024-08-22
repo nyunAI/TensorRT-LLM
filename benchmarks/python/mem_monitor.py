@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 from multiprocessing import Event, Process, Queue
+from queue import Empty
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.profiler import (MemUnitType, bytes_to_target_unit,
@@ -53,13 +54,17 @@ class MemoryMonitor:
         self.signal_event.set()
         logger.debug("Sent signal to stop memory monitor subprocess.")
 
-        peak_mem_use = self.peak_mem_queue.get(timeout=10)
+        try:
+            peak_mem_use = self.peak_mem_queue.get(timeout=20)
+        except Empty:
+            logger.warning("peak_mem_queue was empty.")
+        else:
+            self._peak_host_memory = max(self._peak_host_memory,
+                                         peak_mem_use[0])
+            self._peak_device_memory = max(self._peak_device_memory,
+                                           peak_mem_use[1])
 
-        self._peak_host_memory = max(self._peak_host_memory, peak_mem_use[0])
-        self._peak_device_memory = max(self._peak_device_memory,
-                                       peak_mem_use[1])
-
-        self.mem_monitor_process.join(timeout=10)
+        self.mem_monitor_process.join(timeout=20)
         self.mem_monitor_process = None
         logger.debug("Memory monitor subprocess joined.")
 

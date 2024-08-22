@@ -14,29 +14,36 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <numeric>
+
 #include "tensorrt_llm/common/mpiUtils.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <csignal>
-#include <mpi.h>
+#include <cstdlib>
 #include <mutex>
 #include <type_traits>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
-// We rely on SizeType being int32_t in some places with weak type checking,
+// We rely on SizeType32 being int32_t in some places with weak type checking,
 // i.e. we're passing void ptr to some function. To prevent mysterious errors
-// in the future, we trigger a compilation error here if SizeType isn't int32_t.
-static_assert(std::is_same<tensorrt_llm::runtime::SizeType, std::int32_t>::value);
+// in the future, we trigger a compilation error here if SizeType32 isn't int32_t.
+static_assert(std::is_same<tensorrt_llm::runtime::SizeType32, std::int32_t>::value);
 
 namespace tensorrt_llm::mpi
 {
 
 MPI_Datatype getMpiDtype(MpiType dtype)
 {
-    static const std::unordered_map<MpiType, MPI_Datatype> dtype_map{
-
+#if ENABLE_MULTI_DEVICE
+    static std::unordered_map<MpiType, MPI_Datatype> const dtype_map{
         {MpiType::kBYTE, MPI_BYTE},
         {MpiType::kHALF, MPI_UINT16_T},
         {MpiType::kFLOAT, MPI_FLOAT},
@@ -53,11 +60,15 @@ MPI_Datatype getMpiDtype(MpiType dtype)
         {MpiType::kCHAR, MPI_CHAR},
     };
     return dtype_map.at(dtype);
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
 }
 
 MPI_Op getMpiOp(MpiOp op)
 {
-    static const std::unordered_map<MpiOp, MPI_Op> op_map{
+#if ENABLE_MULTI_DEVICE
+    static std::unordered_map<MpiOp, MPI_Op> const op_map{
         {MpiOp::NULLOP, MPI_OP_NULL},
         {MpiOp::MAX, MPI_MAX},
         {MpiOp::MIN, MPI_MIN},
@@ -74,24 +85,67 @@ MPI_Op getMpiOp(MpiOp op)
         {MpiOp::REPLACE, MPI_REPLACE},
     };
     return op_map.at(op);
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 namespace
 {
 
 bool mpiInitialized = false;
-std::mutex mpiMutex;
+std::recursive_mutex mpiMutex;
+
+MpiComm initLocalSession()
+{
+#if ENABLE_MULTI_DEVICE
+    MPI_Comm localComm;
+    MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, COMM_SESSION.getRank(), MPI_INFO_NULL, &localComm);
+    MpiComm localSession{localComm, false};
+#else
+    MpiComm localSession{COMM_SESSION, false};
+#endif // ENABLE_MULTI_DEVICE
+    return localSession;
+}
 
 } // namespace
 
-void initialize(MpiThreadSupport threadMode)
+std::vector<int> getWorldRanks(MpiComm const& comm)
 {
-    std::lock_guard<std::mutex> lk(mpiMutex);
+#if ENABLE_MULTI_DEVICE
+    MPI_Group group, worldGroup;
+
+    MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+    MPICHECK(MPI_Comm_group(comm, &group));
+
+    int groupSize;
+    MPICHECK(MPI_Group_size(group, &groupSize));
+    std::vector<int> ranks(groupSize), worldRanks(groupSize);
+    std::iota(ranks.begin(), ranks.end(), 0);
+
+    MPICHECK(MPI_Group_translate_ranks(group, groupSize, ranks.data(), worldGroup, worldRanks.data()));
+    MPICHECK(MPI_Group_free(&group));
+    MPICHECK(MPI_Group_free(&worldGroup));
+    std::sort(worldRanks.begin(), worldRanks.end());
+    return worldRanks;
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
+}
+
+void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
+{
+    // double-checked locking
     if (mpiInitialized)
     {
         return;
     }
-
+    std::lock_guard<std::recursive_mutex> lk(mpiMutex);
+    if (mpiInitialized)
+    {
+        return;
+    }
+#if ENABLE_MULTI_DEVICE
     int initialized = 0;
     TLLM_MPI_CHECK(MPI_Initialized(&initialized));
     if (!initialized)
@@ -103,88 +157,245 @@ void initialize(MpiThreadSupport threadMode)
         TLLM_CHECK_WITH_INFO(providedMode >= requiredMode, "MPI_Init_thread failed");
         std::atexit([]() { MPI_Finalize(); });
 
-        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
-    }
+        /*
+         * We only catch SIGABRT and SIGSEGV because most, of not all errors in the worker will cause one of these 2
+         * signals. Signals like SIGINT and SIGTERM should be issued to the parent and should terminate MPI workers
+         * correctly.
+         */
+        for (int sig : {SIGABRT, SIGSEGV})
+        {
+            __sighandler_t previousHandler = nullptr;
+            if (forwardAbortToParent)
+            {
+                previousHandler = std::signal(sig,
+                    [](int signal)
+                    {
+#ifndef _WIN32
+                        pid_t parentProcessId = getppid();
+                        kill(parentProcessId, SIGKILL);
+#endif
+                        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+                    });
+            }
+            else
+            {
+                previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+            }
+            TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
+        }
 
+        // ensure local MPI communicator is initialized
+        MpiComm::localSession();
+        TLLM_LOG_INFO("Initialized MPI");
+    }
+#endif // ENABLE_MULTI_DEVICE
     mpiInitialized = true;
 }
 
 void MpiComm::barrier() const
 {
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Barrier(mComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Ibcast(buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
     return r;
+}
+
+std::shared_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
+{
+    TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
+    return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, mComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+}
+
+void MpiComm::bcast(runtime::IBuffer& buf, int root) const
+{
+    bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
+}
+
+std::shared_ptr<MpiRequest> MpiComm::sendAsync(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
+{
+    TLLM_LOG_DEBUG("start MPI_Isend with size %d", size);
+    std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
+#if ENABLE_MULTI_DEVICE
+    MPICHECK(MPI_Isend(buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
+    TLLM_LOG_DEBUG("end MPI_Isend with size %d", size);
+    return r;
+}
+
+std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, int tag) const
+{
+    return sendAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Send with size %d", size);
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Send with size %d", size);
+}
+
+void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
+{
+    send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Recv with size %d", size);
     MPI_Status status{};
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Recv with size %d", size);
     return status;
+}
+
+MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, int tag) const
+{
+    return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
 }
 
 MpiComm MpiComm::split(int color, int key) const
 {
     MPI_Comm splitComm;
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Comm_split(mComm, color, key, &splitComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
     return MpiComm{splitComm, true};
 }
 
 void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
 {
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), mComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const
 {
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
 {
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Mprobe(source, tag, mComm, msg, status));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 int MpiComm::getRank() const
 {
     int rank = 0;
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Comm_rank(mComm, &rank));
+#endif
     return rank;
 }
 
 int MpiComm::getSize() const
 {
     int world_size = 1;
+#if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Comm_size(mComm, &world_size));
+#endif
     return world_size;
 }
 
 MpiComm const& MpiComm::world()
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     static MpiComm commWorld{MPI_COMM_WORLD, false};
+    initialize();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return commWorld;
 }
 
-MpiComm& MpiComm::session()
+MpiComm& MpiComm::mutableSession()
 {
-    static MpiComm commSession{world(), false};
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    static MpiComm commSession{MPI_COMM_WORLD, false};
+    initialize();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return commSession;
+}
+
+MpiComm& MpiComm::mutableLocalSession()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    static MpiComm localSession = initLocalSession();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return localSession;
+}
+
+void MpiComm::refreshLocalSession()
+{
+#if ENABLE_MULTI_DEVICE
+    static std::vector<int> initSessionRanks;
+    static std::mutex mutex;
+    std::unique_lock lock(mutex);
+    if (initSessionRanks.empty())
+    {
+        auto initSessionRanks = getWorldRanks(MpiComm::session());
+        auto localSessionRanks = getWorldRanks(MpiComm::localSession());
+        std::vector<int> intersectionRanks;
+        std::set_intersection(initSessionRanks.begin(), initSessionRanks.end(), localSessionRanks.begin(),
+            localSessionRanks.end(), std::back_inserter(intersectionRanks));
+
+        MPI_Group worldGroup;
+        MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+        MPI_Group localGroup;
+        MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
+        MPI_Comm localComm;
+        MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
+        MpiComm::mutableLocalSession().mFreeComm = true;
+        MpiComm::mutableLocalSession() = MpiComm{localComm, false};
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(getWorldRanks(MpiComm::session()) == initSessionRanks,
+            "Executors in the same process must use the same participant IDs.");
+    }
+    TLLM_LOG_INFO("Refreshed the MPI local session");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 MpiComm::MpiComm(MPI_Comm g, bool freeComm)
@@ -192,18 +403,19 @@ MpiComm::MpiComm(MPI_Comm g, bool freeComm)
     , mFreeComm{freeComm}
 {
     TLLM_CHECK(mComm != MPI_COMM_NULL);
-    if (g == MPI_COMM_WORLD)
-    {
-        initialize();
-    }
 }
 
 MpiComm::~MpiComm() noexcept
 {
-    if (mFreeComm && mComm && MPI_Comm_free(&mComm) != MPI_SUCCESS)
+#if ENABLE_MULTI_DEVICE
+    if (mFreeComm && mComm)
     {
-        TLLM_LOG_ERROR("MPI_Comm_free failed");
+        if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
+        {
+            TLLM_LOG_ERROR("MPI_Comm_free failed");
+        }
     }
+#endif // ENABLE_MULTI_DEVICE
 }
 
 MpiComm::MpiComm(MpiComm&& comm) noexcept

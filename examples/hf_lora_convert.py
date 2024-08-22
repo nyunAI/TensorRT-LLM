@@ -15,8 +15,6 @@
 # limitations under the License.
 import argparse
 import datetime
-#from utils.convert import cpu_map_location
-#from utils.nemo import unpack_nemo_ckpt
 import json
 import logging
 import re
@@ -26,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -60,17 +59,37 @@ def get_all_lora_weights(lora_weights):
     return all_weights
 
 
+def preprocess_lora_weights(lora_model):
+    # Swap weights of gate_up_proj
+    for key, value in lora_model.items():
+        if "gate_up_proj.lora_B.weight" in key:
+            print("Swap {}".format(key))
+            original_weights = value.contiguous().clone()
+            half_split = original_weights.shape[0] // 2
+            first_half = original_weights[:half_split, :]
+            second_half = original_weights[half_split:, :]
+            value = torch.cat((second_half, first_half), dim=0)
+            lora_model[key] = value
+    return lora_model
+
+
 hf_modules_to_trtllm_modules = {
     "q_proj": "attn_q",
     "v_proj": "attn_v",
     "k_proj": "attn_k",
+    "qkv_proj": "attn_qkv",
+    "query_key_value": "attn_qkv",
     "o_proj": "attn_dense",
+    "dense": "attn_dense",
     "gate_proj": "mlp_h_to_4h",
     "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate"
+    "up_proj": "mlp_gate",
+    "gate_up_proj": "mlp_h_to_4h",
+    "c_fc": "mlp_h_to_4h",
+    "c_proj": "mlp_4h_to_h",
 }  # lora modules on llama
 hf_modules_to_module_id = {
-    k: LoraConfig.LORA_MODULE_IDS[v]
+    k: LoraManager.LORA_MODULE_IDS[v]
     for k, v in hf_modules_to_trtllm_modules.items()
 }
 
@@ -80,8 +99,17 @@ def convert_hf_model(model_dir, dtype, out_dir):
     saved_dir.mkdir(parents=True, exist_ok=True)
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
-        config["r"]
-    lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+
+    rank = config.get("r")
+    alpha = config.get("lora_alpha")
+    use_rslora = config.get("use_rslora", False)
+    if use_rslora:
+        scale = alpha / np.sqrt(rank)
+    else:
+        scale = alpha / rank
+
+    lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
+    lora_model = preprocess_lora_weights(lora_model)
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []
@@ -105,7 +133,8 @@ def convert_hf_model(model_dir, dtype, out_dir):
                 elif dim0 < dim1 and inout == "out":
                     adapter_size = dim0
                     w = w.transpose(1, 0)
-
+                if inout == "out":
+                    w = w * scale
                 w = w.contiguous().flatten().to(dtype=str_dtype_to_torch(dtype))
                 in_out_weights.append(w)
             in_out_weights = torch.concatenate(in_out_weights).flatten()
@@ -119,9 +148,10 @@ def convert_hf_model(model_dir, dtype, out_dir):
         converted_weights[i] = torch.nn.functional.pad(
             converted_weights[i],
             (0, max_row_size - converted_weights[i].shape[0])).unsqueeze(0)
-    converted_weights = torch.concatenate(
-        converted_weights,
-        dim=0).unsqueeze(0).to(dtype=str_dtype_to_torch(dtype)).cpu().numpy()
+    converted_weights = torch_to_numpy(
+        torch.concatenate(
+            converted_weights,
+            dim=0).unsqueeze(0).to(dtype=str_dtype_to_torch(dtype)).cpu())
     converted_config = torch.tensor(converted_config,
                                     dtype=torch.int32,
                                     device='cpu').unsqueeze(0).numpy()

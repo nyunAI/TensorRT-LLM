@@ -1,23 +1,27 @@
-import pickle  # nosec B403
+import abc
 import socket
 import sys
-import threading
 import time
-from concurrent.futures import Future
-from typing import Any, Callable, List, Optional
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, List, Optional
 
-from mpi4py.futures import MPIPoolExecutor
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+
+if ENABLE_MULTI_DEVICE:
+    from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
+
+    from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 
 
-class NodeSession:
-    ''' NodeSession Act as a central global state shares between tasks on MPI node.
+class MPINodeState:
+    ''' MPINodeState acts as a central global state shares between tasks on MPI node.
 
     An example:
         def task():
-            if NodeSession.state is None:
-                NodeSession.state = 0
-            NodeSession.state += 1
-            return NodeSession.state
+            if MPINodeState.state is None:
+                MPINodeState.state = 0
+            MPINodeState.state += 1
+            return MPINodeState.state
 
         n_workers = 4
         with MPIPoolExecutor(max_workers=n_workers) as executor:
@@ -33,30 +37,59 @@ class NodeSession:
 
     @staticmethod
     def is_initialized() -> bool:
-        return NodeSession.state is not None
+        return MPINodeState.state is not None
 
 
-class MpiSession:
+def external_mpi_comm_available(model_world_size: int) -> bool:
+    ''' Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+    e.g. mpirun -np 4 python script.py
+    '''
+    if ENABLE_MULTI_DEVICE:
+        return mpi_world_size() == model_world_size and model_world_size > 1
+    else:
+        return False
 
-    def __init__(self,
-                 n_workers: int,
-                 async_callback: Callable[[Any], None] = None):
+
+def need_spawn_mpi_workers(model_world_size: int) -> bool:
+    ''' Check if the current process needs to spawn MPI workers. '''
+    if ENABLE_MULTI_DEVICE:
+        return mpi_world_size() == 1 and model_world_size > 1
+    else:
+        return False
+
+
+class MpiSession(abc.ABC):
+
+    @abc.abstractmethod
+    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def shutdown(self):
+        raise NotImplementedError()
+
+
+class MpiPoolSession(MpiSession):
+
+    def __init__(self, n_workers: int):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
-        self.async_callback = async_callback
         self._start_mpi_pool()
 
-        if self.async_callback:
-            self._socket_listener = SocketListener(callback=async_callback)
-
-    def submit(self, task: (...), *args) -> List[Future]:
+    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
         return [
-            self.mpi_pool.submit(task, *args) for i in range(self.n_workers)
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
         ]
 
-    def submit_sync(self, task: (...), *args) -> List[Any]:
+    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
         futures = [
-            self.mpi_pool.submit(task, *args) for i in range(self.n_workers)
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
         ]
         return [future.result() for future in futures]
 
@@ -64,23 +97,6 @@ class MpiSession:
         if self.mpi_pool is not None:
             self.mpi_pool.shutdown()
             self.mpi_pool = None
-
-        if self.async_callback is not None and self._socket_listener is not None:
-            self._socket_listener.shutdown()
-            self._socket_listener = None
-
-    def _start(self):
-        assert not self.mpi_pool, 'MPI session already started'
-
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
-                                        path=sys.path)
-
-    @property
-    def async_enabled(self) -> bool:
-        return hasattr(self, '_socket_listener')
-
-    def get_socket_client(self) -> "SocketClient":
-        return self._socket_listener.get_client()
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -95,70 +111,64 @@ class MpiSession:
         raise TypeError('cannot pickle MPI session')
 
 
-class SocketClient:
+class MpiCommSession(MpiSession):
 
-    def __init__(self, port):
-        self.port = port
+    def __init__(self, n_workers: int = 1):
+        if n_workers <= 0:
+            raise ValueError(
+                f'n_workers must be non-negative, but got {n_workers}')
+        if n_workers != mpi_world_size():
+            raise ValueError(
+                f'n_workers must be equal to the number of processes launched by mpirun, got {n_workers} vs {mpi_world_size()}'
+            )
 
-    def send(self, data: Any):
-        # TODO[chunweiy]: reuse socket
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((SocketListener.IP, self.port))
-        client_socket.send(pickle.dumps(data))
-        client_socket.close()
+        if mpi_rank() != 0:
+            raise RuntimeError('only rank 0 can start multi-node session')
+        if not external_mpi_comm_available(n_workers):
+            raise RuntimeError('The LLM instance should be launched by mpirun.')
 
+        self.n_workers = n_workers
+        self.thread_pool: Optional[ThreadPoolExecutor] = None
+        self.mpi_pool: Optional[MPIPoolExecutor] = None
 
-class SocketListener:
-    IP = 'localhost'
+        self._start_mpi_pool()
 
-    def __init__(self,
-                 callback: Optional[Callable[[Any], Any]],
-                 buf_size: int = 4096):
-        self.buf_size = buf_size
-        self.callback = callback
-        self.port = -1
-        self.server_socket = None
+    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
+        assert self.mpi_pool is not None, 'MPI session not started'
 
-        self._start_service()
+        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra task dispatching to rank0 is needed
+        worker_futures = [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers - 1)
+        ]
+        # A trick to wait for rank0 to be ready, or the collective tasks will hang
+        # TODO[chunweiy]: Remove this trick for reducing normal tasks latencies
+        time.sleep(4)
 
-    def _start_service(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.port = find_free_port()
-        self.server_socket.bind((SocketListener.IP, self.port))
+        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
+        return [rank0_future] + worker_futures
 
-        def loop():
-            self.server_socket.listen(5)
-            try:
-                while True:
-                    client_socket, address = self.server_socket.accept()
-                    received_data = client_socket.recv(self.buf_size)
-                    real_data = pickle.loads(received_data)  # nosec B301
-                    if real_data is None:
-                        # get the quit signal
-                        break
-
-                    self.callback(real_data)
-
-            finally:
-                self.server_socket.close()
-
-        self.thread = threading.Thread(target=loop)
-        self.thread.start()
-
-    def get_client(self) -> SocketClient:
-        return SocketClient(self.port)
+    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
+        futures = self.submit(task, *args, **kwargs)
+        return [future.result() for future in futures]
 
     def shutdown(self):
-        if self.server_socket is not None:
-            client = self.get_client()
-            client.send(None)
-            time.sleep(0.1)
-            self.server_socket = None
+        if self.mpi_pool is not None:
+            self.mpi_pool.shutdown()
+            self.mpi_pool = None
+
+    def _start_mpi_pool(self):
+        assert not self.mpi_pool, 'MPI session already started'
+
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        comm_executor = MPICommExecutor(mpi_comm())
+        self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):
         self.shutdown()
 
-        self.thread.join()
+    def __reduce__(self):
+        raise TypeError('cannot pickle MPI session')
 
 
 def find_free_port() -> int:

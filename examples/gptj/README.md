@@ -2,6 +2,20 @@
 
 This document explains how to build the [GPT-J](https://huggingface.co/EleutherAI/gpt-j-6b) model using TensorRT-LLM and run on a single GPU.
 
+- [GPT-J](#gpt-j)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace (HF) Transformers](#1-download-weights-from-huggingface-hf-transformers)
+    - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [AWQ INT4 weight only quantization](#awq-int4-weight-only-quantization)
+      - [SmoothQuant (W8A8) quantization](#smoothquant-w8a8-quantization)
+      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
+      - [INT8 KV cache](#int8-kv-cache)
+    - [3. Run](#3-run)
+  - [Summarization using the GPT-J model](#summarization-using-the-gpt-j-model)
+
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
@@ -20,10 +34,17 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * FP8 (with FP8 kv cache)
   * Groupwise quantization (AWQ)
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
+  * INT8 SmoothQuant
 
 ## Usage
 
 ### 1. Download weights from HuggingFace (HF) Transformers
+
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
 
 ```bash
 # 1. Weights & config
@@ -61,7 +82,7 @@ trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1919 \
-             --max_output_len=128
+             --max_seq_len=2047
 ```
 
 INT8 weight-only
@@ -91,9 +112,9 @@ Building command is identical to the common one above.
 
 #### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 One can quantize HF GPT-J weights in FP8 as follows.
 
@@ -107,6 +128,7 @@ python ../quantization/quantize.py --model_dir ./gpt-j-6b \
                                    --calib_size 512
 ```
 Building command is identical to the common one above.
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 #### AWQ INT4 weight only quantization
 
@@ -151,14 +173,14 @@ Building command is identical to the common one above.
 
 You can enable the FMHA kernels for GPT by adding `--context_fmha` to the invocation of `trtllm-build`. Note that it is enabled by default.
 
-If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
 
-Note `--context_fmha` / `--context_fmha_fp32_acc` has to be used together with `--gpt_attention_plugin float16`.
+Note `--context_fmha` has to be used together with `--gpt_attention_plugin float16`.
 
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through AMMO:
+You can get the INT8 scale of KV cache through Modelopt:
 
 ```bash
 # INT8 calibration

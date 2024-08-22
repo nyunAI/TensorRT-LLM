@@ -2,6 +2,19 @@
 
 This document shows how to build and run a BLOOM model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
+## Table of Contents
+
+- [BLOOM](#bloom)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [Build TensorRT engine(s)](#build-tensorrt-engines)
+      - [INT8 weight only + INT8 KV cache](#int8-weight-only--int8-kv-cache)
+      - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+    - [Run](#run)
+
 ## Overview
 
 The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There is one main file:
@@ -19,6 +32,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * INT8 KV CACHE
   * Smooth Quant
   * Tensor Parallel
+  * FP8 and FP8 KV cache
 
 ## Usage
 
@@ -26,7 +40,13 @@ The TensorRT-LLM BLOOM example code locates at [examples/bloom](./). It takes HF
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF BLOOM checkpoint first by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/bloom.
+Please install required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
+Need to prepare the HF BLOOM checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/bloom.
 
 e.g. To install BLOOM-560M
 
@@ -137,7 +157,7 @@ python convert_checkpoint.py --model_dir ./bloom/560m/ \
                 --use_weight_only --output_dir ./bloom/560m/trt_ckpt/int8/1-gpu/
 trtllm-build --checkpoint_dir ./bloom/560m/trt_ckpt/int8/1-gpu/ \
                 --gemm_plugin float16 \
-                --output_dir ./bloom/560m/trt_engines/int8/1-gpu/
+                --output_dir ./bloom/560m/trt_engines/int8/1-gpu/ \
 ```
 
 
@@ -169,7 +189,26 @@ Note that GPT attention plugin is required to be enabled for SmoothQuant for now
 
 Note we use `--bin_model_dir` instead of `--model_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
-### 4. Run
+#### FP8 Post-Training Quantization
+
+```
+# Quantize HF Bloom 3B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir /tmp/bloom/3b/trt_ckpts/fp8/1-gpu/ \
+                                   --calib_size 512 \
+                                   --tp_size 1
+
+trtllm-build --checkpoint_dir /tmp/bloom/3b/trt_ckpts/fp8/1-gpu/ \
+             --output_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/ \
+             --gemm_plugin float16 \
+             --use_fp8_context_fmha enable \
+             --workers 1
+```
+
+### Run
 
 ```bash
 python ../summarize.py --test_trt_llm \
@@ -193,4 +232,9 @@ mpirun -n 8 --allow-run-as-root \
                            --hf_model_dir ./bloom/176B/ \
                            --data_type fp16 \
                            --engine_dir ./bloom/176B/trt_engines/fp16/8-gpu/
+
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir /home/scratch.trt_llm_data/llm-models/bloom-3b \
+                       --data_type fp16 \
+                       --engine_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/
 ```

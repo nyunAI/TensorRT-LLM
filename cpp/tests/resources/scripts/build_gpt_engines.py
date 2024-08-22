@@ -14,50 +14,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse as _arg
-import os as _os
-import pathlib as _pl
-import platform as _pf
-import typing as _tp
+import argparse
+import os
+import platform
+import sys
+from pathlib import Path
+from typing import Optional
 
-import hf_gpt_convert as _egc
-import torch.multiprocessing as _mp
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
 
-import build as _egb  # isort:skip
+init_model_spec_module()
+import shutil
+
+import model_spec
+
+import tensorrt_llm.bindings as _tb
+
+
+def convert_ckpt(model_dir: str,
+                 output_dir: str,
+                 *args,
+                 world_size: int = 1,
+                 dtype: str = 'float16'):
+    convert_cmd = [
+        sys.executable, "examples/gpt/convert_checkpoint.py",
+        f"--model_dir={model_dir}", f"--output_dir={output_dir}",
+        f"--dtype={dtype}", f"--tp_size={world_size}"
+    ] + list(args)
+    run_command(convert_cmd)
 
 
 def build_engine(
-    weight_dir: _pl.Path,
-    engine_dir: _pl.Path,
-    world_size,
+    checkpoint_dir: str,
+    engine_dir: str,
     *args,
-    max_input_len=256,
-    max_output_len=128,
+    max_input_len: int = 256,
+    max_seq_len: int = 384,
 ):
-    args = [
+
+    if os.path.exists(engine_dir):
+        assert False
+    build_cmd = [
+        "trtllm-build",
         '--log_level=error',
-        '--model_dir',
-        str(weight_dir),
-        '--output_dir',
-        str(engine_dir),
+        f'--checkpoint_dir={checkpoint_dir}',
+        f'--output_dir={engine_dir}',
         '--max_batch_size=64',
         f'--max_input_len={max_input_len}',
-        f'--max_output_len={max_output_len}',
+        f'--max_seq_len={max_seq_len}',
         '--max_beam_width=2',
         '--builder_opt=0',
-        f'--world_size={world_size}',
-    ] + list(args)
-    print("Running: build " + " ".join(args))
-    _egb.run_build(args)
+        '--kv_cache_type=continuous',
+    ]
+    legacy_args = [
+        "--gpt_attention_plugin=disable",
+        "--context_fmha=disable",
+        "--remove_input_padding=disable",
+        "--enable_xqa=disable",
+    ]
+    build_cmd = build_cmd + legacy_args + list(args)
+    run_command(build_cmd)
 
 
-def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
+def build_engines(model_cache: Optional[str] = None,
+                  world_size: int = 1,
+                  clean: Optional[bool] = False):
     # TODO add support of Pipeline parallelism to GPT
     tp_size = world_size
     pp_size = 1
 
-    resources_dir = _pl.Path(__file__).parent.resolve().parent
+    resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     model_name = 'gpt2'
 
@@ -67,13 +93,13 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         assert hf_dir.is_dir()
         run_command(["git", "pull"], cwd=hf_dir)
     else:
-        if _pf.system() == "Windows":
+        if platform.system() == "Windows":
             url_prefix = ""
         else:
             url_prefix = "file://"
 
         model_url = url_prefix + str(
-            _pl.Path(model_cache) /
+            Path(model_cache) /
             model_name) if model_cache else "https://huggingface.co/gpt2"
         run_command([
             "git", "clone", model_url, "--single-branch", "--no-local",
@@ -81,7 +107,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         ],
                     cwd=hf_dir.parent,
                     env={
-                        **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
+                        **os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
                     })
 
     assert hf_dir.is_dir()
@@ -89,16 +115,16 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     # Download the model file
     model_file_name = "pytorch_model.bin"
     if model_cache:
-        if _pf.system() == "Windows":
+        if platform.system() == "Windows":
             wincopy(source=str(
-                _pl.Path(model_cache) / model_name / model_file_name),
+                Path(model_cache) / model_name / model_file_name),
                     dest=model_file_name,
                     isdir=False,
                     cwd=hf_dir)
         else:
             run_command([
                 "rsync", "-av",
-                str(_pl.Path(model_cache) / model_name / model_file_name), "."
+                str(Path(model_cache) / model_name / model_file_name), "."
             ],
                         cwd=hf_dir)
     else:
@@ -112,108 +138,193 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
     assert (hf_dir / model_file_name).is_file()
 
-    weight_dir = models_dir / 'c-model' / model_name
+    ckpt_dir = models_dir / 'c-model' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
+
+    if clean:
+        target_dir = Path(engine_dir)
+        print('clean up target folder ', target_dir)
+        if target_dir.is_dir():
+            shutil.rmtree(target_dir, ignore_errors=True)
 
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
     tp_dir = f"{world_size}-gpu"
 
     print("\nConverting to fp32")
-    fp32_weight_dir = weight_dir / 'fp32'
-    _egc.run_conversion(
-        _egc.ProgArgs(in_file=str(hf_dir),
-                      out_dir=str(fp32_weight_dir),
-                      storage_type='float32',
-                      tensor_parallelism=tp_size))
+    fp32_ckpt_dir = ckpt_dir / 'fp32' / tp_dir
+    convert_ckpt(str(hf_dir),
+                 str(fp32_ckpt_dir),
+                 world_size=tp_size,
+                 dtype='float32')
 
+    input_file = 'input_tokens.npy'
     print("\nBuilding fp32 engines")
-    fp32_weight_dir_x_gpu = fp32_weight_dir / tp_dir
-    build_engine(fp32_weight_dir_x_gpu, engine_dir / 'fp32-default' / tp_pp_dir,
-                 tp_size, '--dtype=float32')
-    build_engine(fp32_weight_dir_x_gpu, engine_dir / 'fp32-plugin' / tp_pp_dir,
-                 tp_size, '--dtype=float32',
-                 '--use_gpt_attention_plugin=float32')
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FLOAT)
+    build_engine(str(fp32_ckpt_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir))
+    model_spec_obj.use_gpt_plugin()
+    build_engine(str(fp32_ckpt_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
+                 '--gpt_attention_plugin=float32', '--context_fmha=enable')
 
     print("\nConverting to fp16")
-    fp16_weight_dir = weight_dir / 'fp16'
-    _egc.run_conversion(
-        _egc.ProgArgs(in_file=str(hf_dir),
-                      out_dir=str(fp16_weight_dir),
-                      storage_type='float16',
-                      tensor_parallelism=tp_size))
+    fp16_ckpt_dir = ckpt_dir / 'fp16' / tp_dir
+    convert_ckpt(str(hf_dir),
+                 str(fp16_ckpt_dir),
+                 world_size=tp_size,
+                 dtype='float16')
 
     print("\nBuilding fp16 engines")
-    fp16_weight_dir_x_gpu = fp16_weight_dir / tp_dir
-    build_engine(fp16_weight_dir_x_gpu, engine_dir / 'fp16-default' / tp_pp_dir,
-                 tp_size, '--dtype=float16')
-    build_engine(fp16_weight_dir_x_gpu, engine_dir / 'fp16-plugin' / tp_pp_dir,
-                 tp_size, '--dtype=float16',
-                 '--use_gpt_attention_plugin=float16')
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-plugin-packed' / tp_pp_dir, tp_size,
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding')
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    build_engine(str(fp16_ckpt_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir))
+    model_spec_obj.use_gpt_plugin()
+    build_engine(str(fp16_ckpt_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
+                 '--gpt_attention_plugin=float16')
+    model_spec_obj.use_packed_input()
+    build_engine(str(fp16_ckpt_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
+                 '--gpt_attention_plugin=float16',
+                 '--remove_input_padding=enable')
+
     # this engine can be use for in-flight batching
-    ifb_args = [
-        '--dtype=float16',
-        '--use_gpt_attention_plugin=float16',
-        '--remove_input_padding',
-        '--paged_kv_cache',
-        '--enable_context_fmha_fp32_acc',
+    ifb_base_args = [
+        '--gpt_attention_plugin=float16',
+        '--remove_input_padding=enable',
+        '--context_fmha=enable',
         '--max_num_tokens=10000',
-        '--use_paged_context_fmha',
+        '--use_paged_context_fmha=enable',
     ]
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
-                 '--max_draft_len=5', *ifb_args)
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir,
-                 tp_size,
-                 max_input_len=128,
-                 *ifb_args)
+
+    paged_kv_cache_args = ['--kv_cache_type=paged']
+
+    no_kv_cache_args = ['--kv_cache_type=disabled']
+
+    def get_ifb_args(kv_cache_type):
+        if kv_cache_type == _tb.KVCacheType.DISABLED:
+            return ifb_base_args + no_kv_cache_args
+        elif kv_cache_type == _tb.KVCacheType.PAGED:
+            return ifb_base_args + paged_kv_cache_args
+        else:
+            assert False, f"Unsupported kv_cache_type: {kv_cache_type}"
+
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+
+    model_spec_current = model_spec_obj.__copy__()
+
+    for kv_cache_type in [_tb.KVCacheType.DISABLED, _tb.KVCacheType.PAGED]:
+        model_spec_current.set_kv_cache_type(kv_cache_type)
+        build_engine(
+            str(fp16_ckpt_dir),
+            str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+            *get_ifb_args(kv_cache_type))
+
+    model_spec_current = model_spec_obj.__copy__()
+    max_draft_tokens = 5
+    model_spec_current.use_draft_tokens_external_decoding()
+    model_spec_current.set_draft_tokens(max_draft_tokens)
+
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        f'--max_draft_len={max_draft_tokens}',
+        '--speculative_decoding_mode=draft_tokens_external',
+        *get_ifb_args(_tb.KVCacheType.PAGED))
+
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.use_multiple_profiles()
+
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        '--multiple_profiles=enable', *get_ifb_args(_tb.KVCacheType.PAGED))
+
+    model_spec_current = model_spec_obj.__copy__()
+    max_input_len = 128
+    model_spec_current.set_max_input_length(max_input_len)
+
+    build_engine(str(fp16_ckpt_dir),
+                 str(engine_dir / model_spec_current.get_model_path() /
+                     tp_pp_dir),
+                 *get_ifb_args(_tb.KVCacheType.PAGED),
+                 max_input_len=max_input_len)
+
+    # Build the target model with return accepted token logits
+    # Build with '--max_draft_len', '--speculative_decoding_mode' and '--gather_generation_logits'
+    model_spec_current = model_spec_obj.__copy__()
+    max_draft_len = 5
+    model_spec_current.use_draft_tokens_external_decoding()
+    model_spec_current.set_draft_tokens(max_draft_len)
+    model_spec_current.gather_logits()
+    model_spec_current.return_accepted_tokens_logits()
+
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        f'--max_draft_len={max_draft_len}',
+        '--speculative_decoding_mode=draft_tokens_external',
+        '--gather_generation_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.
     # Currently the gather_all_token_logits is not supported with target model of speculative decoding
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
-                 tp_size, '--gather_all_token_logits', *ifb_args)
-    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.gather_logits()
+
     build_engine(
-        fp16_weight_dir_x_gpu, engine_dir /
-        'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,
-        '--use_context_fmha_for_generation', '--max_draft_len=5', *ifb_args)
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        '--gather_all_token_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     # build engine with lora enabled
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / "fp16-plugin-packed-paged-lora" / tp_pp_dir,
-                 tp_size, '--use_lora_plugin=float16',
-                 '--lora_target_modules=attn_qkv', *ifb_args)
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.use_lora_plugin()
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
+        *get_ifb_args(_tb.KVCacheType.PAGED))
 
+    if model_cache:
+        llm_datasets_root = Path(model_cache) / "datasets"
+        calib_dataset = llm_datasets_root / "cimec/lambada/"
+    else:
+        calib_dataset = "lambada"
     print("\nConverting to fp16 SQ")
-    fp16_weight_dir = weight_dir / 'fp16-sq'
-    fp16_weight_dir_x_gpu = fp16_weight_dir / tp_dir
-    _egc.run_conversion(
-        _egc.ProgArgs(in_file=str(hf_dir),
-                      out_dir=str(fp16_weight_dir),
-                      storage_type='float16',
-                      tensor_parallelism=tp_size,
-                      smoothquant=0.5))
+    fp16_sq_ckpt_dir = ckpt_dir / 'fp16-sq' / tp_dir
+    convert_ckpt(str(hf_dir),
+                 str(fp16_sq_ckpt_dir),
+                 "--smoothquant=0.5",
+                 f"--calib_dataset={calib_dataset}",
+                 world_size=tp_size,
+                 dtype='float16')
 
     print("\nBuilding fp16 SQ engines")
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-plugin-packed-paged-sq' / tp_pp_dir,
-                 tp_size, *ifb_args)
+    model_spec_current = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_current.use_gpt_plugin()
+    model_spec_current.use_packed_input()
+    model_spec_current.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
+
+    for kv_cache_type in [_tb.KVCacheType.DISABLED, _tb.KVCacheType.PAGED]:
+        model_spec_current.set_kv_cache_type(kv_cache_type)
+        build_engine(
+            str(fp16_sq_ckpt_dir),
+            str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+            *get_ifb_args(kv_cache_type))
 
     if has_safetensor:
-        _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)
+        Path(str(safetensor_file) + ".bak").rename(safetensor_file)
 
     print("Done.")
 
 
 if __name__ == "__main__":
-    parser = _arg.ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_cache",
                         type=str,
                         help="Directory where models are stored")
@@ -221,8 +332,11 @@ if __name__ == "__main__":
     parser.add_argument('--world_size',
                         type=int,
                         default=1,
-                        help='world size, only support tensor parallelism now')
+                        help='World size, only support tensor parallelism now')
 
-    _mp.set_start_method("spawn")
+    parser.add_argument('--clean',
+                        action='store_true',
+                        default=False,
+                        help='Clean target folders before building engines')
 
     build_engines(**vars(parser.parse_args()))

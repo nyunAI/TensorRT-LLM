@@ -17,26 +17,25 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 
 #include <NvInferRuntime.h>
-
-#include <NvInferRuntimeBase.h>
-#include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <map>
-#include <memory>
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+
+#include <cstring>
+#include <map>
+#include <memory>
+#include <nvml.h>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -149,7 +148,7 @@ public:
 };
 
 // for testing only
-void* getCommSessionHandle();
+void const* getCommSessionHandle();
 } // namespace tensorrt_llm::plugins
 
 inline bool isBuilding()
@@ -173,9 +172,7 @@ inline bool isBuilding()
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
-std::map<std::set<int>, ncclComm_t>* getCommMap();
-
-void initCommMap(std::set<int> const& group);
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
 
@@ -183,6 +180,8 @@ void initCommMap(std::set<int> const& group);
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
+    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace);
 
 #ifndef DEBUG
 
@@ -302,3 +301,14 @@ private:
 
     std::unordered_map<std::string_view, Record> mMap;
 };
+
+#define NVML_CHECK(cmd)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        nvmlReturn_t r = cmd;                                                                                          \
+        if (r != NVML_SUCCESS)                                                                                         \
+        {                                                                                                              \
+            printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                         \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)

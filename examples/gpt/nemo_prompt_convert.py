@@ -22,10 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from utils.convert import cpu_map_location
-from utils.nemo import unpack_nemo_ckpt
 
 from tensorrt_llm._utils import torch_to_numpy
+from tensorrt_llm.models.gpt.convert import cpu_map_location, unpack_nemo_ckpt
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)

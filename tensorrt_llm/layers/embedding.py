@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Optional
 
 import torch
 
-from .._utils import set_obj_attrs
+from .._utils import set_obj_attrs, str_dtype_to_torch
 from ..functional import embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
@@ -37,13 +38,13 @@ class Embedding(Module):
     """
 
     def __init__(self,
-                 num_embeddings,
-                 embedding_dim,
-                 dtype=None,
-                 tp_size=1,
-                 tp_group=None,
-                 sharding_dim=0,
-                 tp_rank=None):
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 dtype: Optional[str] = None,
+                 tp_size: int = 1,
+                 tp_group: Optional[list] = None,
+                 sharding_dim: int = 0,
+                 tp_rank: Optional[int] = None):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings
@@ -52,6 +53,8 @@ class Embedding(Module):
         self.tp_group = tp_group
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
+        self.dtype = dtype
+        self.tp_dim = sharding_dim
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -85,6 +88,17 @@ class Embedding(Module):
             loaded_weight = loaded_weight.narrow(sharding_dim, start_idx,
                                                  shard_size)
         param.value = loaded_weight
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        config = kwargs.get("config", None)
+        if weights is None:
+            return {}
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        if config.share_embedding_table:
+            return {}
+        else:
+            weights = weights.clone()
+            return {tllm_key: weights}
 
 
 class PromptTuningEmbedding(Embedding):

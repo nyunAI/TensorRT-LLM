@@ -180,7 +180,8 @@ INSTANTIATE_ADDQKVBIASIA3_TRANSPOSE(__nv_bfloat16);
 template <typename T, typename T_IN, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask, T const* linear_bias_slopes,
     const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length,
-    float const qk_scale)
+    float const qk_scale, float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -217,11 +218,24 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
                 qk_bias += static_cast<float>(linear_bias_slope * (ki - qi));
             }
 
-            int64_t mask_offset = ((int64_t) bi * q_length + qi) * k_length + ki;
-            float mask_val = static_cast<float>(ldg(&attn_mask[mask_offset]));
+            float mask_val;
+            if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+            {
+                // We cannot share attention mask across heads. Instead, we compute mask on the fly here.
+                mask_val = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? 1.f : 0.f;
+            }
+            else
+            {
+                int64_t mask_offset = ((int64_t) bi * q_length + qi) * k_length + ki;
+                mask_val = static_cast<float>(ldg(&attn_mask[mask_offset]));
+            }
             qk_bias += (1.0f - mask_val) * -10000.0f;
 
             data[i] = qk_scale * qk_val + qk_bias;
+            if (qk_tanh_scale > 0.f)
+            {
+                data[i] = qk_tanh_scale * tanhf(data[i] * qk_tanh_inverse_scale);
+            }
             local_max = fmax(local_max, data[i]);
         }
 
@@ -259,7 +273,9 @@ __global__ void softmax_kernel(T* attn_score, const T_IN* qk, T const* attn_mask
 
 template <typename T, int ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
-    const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T qk_scale)
+    const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T qk_scale,
+    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -319,10 +335,25 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
                 qk_bias = hadd2<T2>(qk_bias, hmul2<T2>(linear_bias_slope, dist));
             }
 
-            T2 mask_val = ldg(&attn_mask_h2[mask_offset]);
+            T2 mask_val;
+            if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+            {
+                mask_val = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? ONE : ZERO;
+            }
+            else
+            {
+                mask_val = ldg(&attn_mask_h2[mask_offset]);
+            }
             qk_bias = hadd2<T2>(qk_bias, hmul2<T2>(hsub2<T2>(ONE, mask_val), NEG_INFTY));
 
             data[i] = hadd2<T2>(hmul2<T2>(qk, qk_scale_h2), qk_bias);
+            if (qk_tanh_scale > 0.f)
+            {
+                float2 f2;
+                f2.x = qk_tanh_scale * tanhf((float) data[i].x * qk_tanh_inverse_scale);
+                f2.y = qk_tanh_scale * tanhf((float) data[i].y * qk_tanh_inverse_scale);
+                data[i] = cuda_cast<T2>(f2);
+            }
             local_max = fmax(local_max, fmax((float) data[i].x, (float) data[i].y));
         }
 
@@ -361,7 +392,9 @@ __global__ void softmax_kernel_h2(T* attn_score, T const* qk_buf, T const* attn_
 
 template <typename T, int K_ITEMS_PER_THREAD, int Q_ITEMS_PER_THREAD>
 __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* attn_mask, T const* linear_bias_slopes,
-    const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T scalar)
+    const int64_t batch_size, const int64_t head_num, const int64_t q_length, const int64_t k_length, const T scalar,
+    float const qk_tanh_scale, float const qk_tanh_inverse_scale, bool const block_sparse_attn,
+    BlockSparseParams const block_sparse_params, int const* q_seq_lengths)
 {
     // attn_score, [batch_size, num_heads, q_length, k_length]
     // qk, [batch_size, num_heads, q_length, k_length]
@@ -423,7 +456,14 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             T2 mask_val[Q_ITEMS_PER_THREAD];
             for (int j = 0; j < q_items; j++)
             {
-                mask_val[j] = ldg(&attn_mask_h2[mask_offset[j]]);
+                if (block_sparse_attn && block_sparse_params.homo_head_pattern == false)
+                {
+                    mask_val[j] = block_sparse_params.computeMask(qi, ki, q_seq_lengths[bi], head_num, hi) ? ONE : ZERO;
+                }
+                else
+                {
+                    mask_val[j] = ldg(&attn_mask_h2[mask_offset[j]]);
+                }
             }
 
             T2 qk[Q_ITEMS_PER_THREAD];
@@ -457,6 +497,13 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             for (int j = 0; j < q_items; j++)
             {
                 T2 val = hadd2<T2>(hmul2<T2>(qk_scale, qk[j]), mask_val[j]);
+                if (qk_tanh_scale > 0.f)
+                {
+                    float2 f2;
+                    f2.x = qk_tanh_scale * tanhf(float(val.x) * qk_tanh_inverse_scale);
+                    f2.y = qk_tanh_scale * tanhf(float(val.y) * qk_tanh_inverse_scale);
+                    val = cuda_cast<T2>(f2);
+                }
                 if (linear_bias_slopes != nullptr)
                 {
                     val = hadd2<T2>(val, pos_bias[j]);
@@ -552,20 +599,25 @@ __global__ void softmax_kernel_h2_v2(T* attn_score, T const* qk_buf, T const* at
             grid.x /= 4;                                                                                               \
             softmax_kernel_h2_v2<T_, ITEMS_PER_THREAD, 4><<<grid, block, 0, stream>>>((T_*) param.attention_score,     \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
-                param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale);         \
+                param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
+                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
+                param.q_seq_lengths);                                                                                  \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
             softmax_kernel_h2<T_, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>((T_*) param.attention_score,           \
                 (const T_*) param.qk, (const T_*) param.attention_mask, (const T_*) param.linear_bias_slopes,          \
-                param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale);         \
+                param.batch_size, param.num_heads, param.q_length, param.k_length, (const T_) param.qk_scale,          \
+                param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, param.block_sparse_params,  \
+                param.q_seq_lengths);                                                                                  \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         softmax_kernel<T, T_IN, ITEMS_PER_THREAD><<<grid, block, 0, stream>>>(param.attention_score, param.qk,         \
             param.attention_mask, param.linear_bias_slopes, param.batch_size, param.num_heads, param.q_length,         \
-            param.k_length, param.qk_scale);                                                                           \
+            param.k_length, param.qk_scale, param.qk_tanh_scale, param.qk_tanh_inverse_scale, param.block_sparse_attn, \
+            param.block_sparse_params, param.q_seq_lengths);                                                           \
     }
 
 #define LAUNCH_MASKED_SOFTMAX(ITEMS_PER_THREAD) LAUNCH_MASKED_SOFTMAX_(half, ITEMS_PER_THREAD)
@@ -1013,8 +1065,10 @@ __global__ void transpose_remove_padding(T const* src, T* dst, int const batch_s
     // do remove_sequence_length_padding
     int const bid = blockIdx.x; // batch * seq_len or valid_word_num
 
-    int const src_batch_id = (bid + mask_offset[bid]) / seq_len;
-    int const src_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const mask_offset_value = (mask_offset == nullptr) ? 0 : mask_offset[bid];
+
+    int const src_batch_id = (bid + mask_offset_value) / seq_len;
+    int const src_seq_id = (bid + mask_offset_value) % seq_len;
 
     int const dst_seq_id = bid;
 
@@ -1114,7 +1168,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
     // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
-    bool const has_padding = padding_offset == nullptr;
+    bool const has_padding = padding_offset != nullptr;
     int const hidden = head_num * size_per_head; // hidden dim Q
     int const n = hidden + 2 * kv_head_num * size_per_head;
 
@@ -1123,11 +1177,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int const bias_id = index % n;
 
         int const token_idx = index / n;
-        int const token_padded_idx = token_idx + (has_padding ? 0 : padding_offset[token_idx]);
+        int const token_padded_idx = token_idx + (has_padding ? padding_offset[token_idx] : 0);
         int const target_batch_id = token_padded_idx / seq_len;
         int const actual_seq_len = seq_lens[target_batch_id];
         int const seq_id = token_padded_idx % seq_len;
-        bool const valid_seq = seq_id < actual_seq_len || !has_padding;
+        bool const valid_seq = seq_id < actual_seq_len || has_padding;
 
         int qkv_id;
         int head_id;
@@ -1267,12 +1321,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     int const token_idx = blockIdx.x;
     int const token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
     int const tgt_token_idx = token_idx + token_padding_offset;
-    bool const has_padding = padding_offset == nullptr;
+    bool const has_padding = padding_offset != nullptr;
 
     int const batch_idx = tgt_token_idx / seq_len;
     int const seq_idx = tgt_token_idx % seq_len;
     int const actual_seq_len = seq_lens[batch_idx];
-    bool const valid_seq = seq_idx < actual_seq_len || !has_padding;
+    bool const valid_seq = seq_idx < actual_seq_len || has_padding;
 
     int const head_idx = blockIdx.y;
     int const tidx = threadIdx.x;
@@ -1351,6 +1405,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, dst_kv_seq_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1469,9 +1524,10 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
-        size_t smem_size
-            = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T)
-                                                                                : 0);
+        size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                    || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                ? 2 * rotary_embedding_dim * sizeof(T)
+                : 0);
         // NOTE: add offset for rotary embedding
         if (qkv_bias != nullptr)
         {
@@ -1775,7 +1831,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     // Use 8bit cache.
     static constexpr bool ENABLE_8BITS_CACHE = sizeof(T_cache) == 1;
     // FP8 KV Cache.
-    static constexpr bool FP8_K_CACHE = std::is_same<T_cache, __nv_fp8_e4m3>::value;
+    [[maybe_unused]] static constexpr bool FP8_K_CACHE = std::is_same<T_cache, __nv_fp8_e4m3>::value;
     // INT8 KV Cache.
     static constexpr bool INT8_K_CACHE = std::is_same<T_cache, int8_t>::value;
 
@@ -1816,7 +1872,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     bool const is_head_size_masked = tidx * vec_size >= sizePerHead;
 
     // Dequant scales for 8bits k cache
-    float k_scale_quant_orig = (ENABLE_8BITS_CACHE ? kScaleQuantOrig[0] : 1.0f);
+    [[maybe_unused]] float k_scale_quant_orig = (ENABLE_8BITS_CACHE ? kScaleQuantOrig[0] : 1.0f);
 
     if (!valid_seq || is_head_size_masked)
     {
@@ -1861,6 +1917,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
             k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1907,20 +1964,22 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
-    int const sizePerHead, int const timestep, int const batch_beam, int const kv_head_num, int const beam_width,
-    int const maxKCacheLen, int const sinkTokenLen, float const* kScaleQuantOrig, int const* sequence_lengths,
-    int const* input_lengths, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
-    PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
+    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
+    float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    int const rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
 {
     // Block handles K tile.
     int const token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     if (cache_type == KvCacheDataType::INT8)
     {
@@ -1948,10 +2007,10 @@ void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBu
 }
 
 #define INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVCacheBuffer)                                                         \
-    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer,   \
-        const KvCacheDataType cache_type, const int sizePerHead, const int timestep, const int batch_beam,             \
-        const int kv_head_num, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,                   \
-        const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,                           \
+    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer const& kvCacheBuffer,                              \
+        KVLinearBuffer const& shiftKCacheBuffer, const KvCacheDataType cache_type, const int sizePerHead,              \
+        const int timestep, const int batch_beam, const int kv_head_num, const int beam_width, const int maxKCacheLen, \
+        const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,   \
         const int rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,        \
         float rotary_embedding_scale, const int rotary_embedding_max_positions,                                        \
         PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
@@ -1968,6 +2027,109 @@ INSTANTIATE_SHIFT_K_CACHE(__nv_bfloat16);
 
 #undef INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE
 #undef INSTANTIATE_SHIFT_K_CACHE
+
+namespace
+{
+template <typename T, uint32_t size_>
+struct alignas(std::max<uint32_t>(alignof(T), std::min<uint32_t>(sizeof(T) * size_, 16))) Vec
+{
+    using Elem = T;
+    static constexpr uint32_t size = size_;
+    Elem data[size];
+
+    __device__ inline void fill(T val)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < size; i++)
+        {
+            data[i] = val;
+        }
+    }
+
+    static __device__ inline Vec<T, size> filled(T val)
+    {
+        Vec<T, size> ret;
+        ret.fill(val);
+        return ret;
+    }
+
+    __device__ inline Elem const& operator[](uint32_t i) const
+    {
+        assert(i < size);
+        return data[i];
+    }
+
+    __device__ inline Elem& operator[](uint32_t i)
+    {
+        assert(i < size);
+        return data[i];
+    }
+};
+
+template <typename Dst, typename Src>
+__global__ void convertData(Dst* dst, Src const* src, int64_t size, float const* __restrict__ pScale)
+{
+    constexpr uint32_t srcElemSize = sizeof(Src);
+    constexpr uint32_t dstElemSize = sizeof(Dst);
+    static_assert((srcElemSize & (srcElemSize - 1)) == 0 && (dstElemSize & (dstElemSize - 1)) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(dst) % 16 == 0 && reinterpret_cast<std::uintptr_t>(src) % 16 == 0);
+    constexpr uint32_t packSize = 16 / std::max(srcElemSize, dstElemSize);
+    auto const tid = blockDim.x * blockIdx.x + threadIdx.x;
+    auto const nbThrds = blockDim.x * gridDim.x;
+    if (tid * packSize >= size)
+    {
+        return;
+    }
+    float const scale = (pScale == nullptr ? 1.F : pScale[0]);
+    using SrcPack = Vec<Src, packSize>;
+    using DstPack = Vec<Dst, packSize>;
+    int64_t const stride = packSize * nbThrds;
+    for (int64_t i = tid * packSize; i < size; i += stride)
+    {
+        if (i + packSize < size)
+        {
+            auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
+            DstPack dstPack;
+#pragma unroll
+            for (int32_t j = 0; j < packSize; j++)
+            {
+                dstPack[j] = Dst{float{srcPack[j]} * scale};
+            }
+            reinterpret_cast<DstPack&>(dst[i]) = dstPack;
+        }
+        else
+        {
+#pragma unroll
+            for (int64_t j = 0; j < packSize; j++)
+            {
+                if (i + j >= size)
+                {
+                    break;
+                }
+                dst[i + j] = Dst{float{src[i + j]} * scale};
+            }
+        }
+    }
+}
+} // unnamed namespace
+
+template <typename Dst, typename Src>
+void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+{
+    auto const packSize = 16 / std::max(sizeof(Dst), sizeof(Src));
+    auto const nbPack = divUp(size, packSize);
+    uint32_t const ctaSize = 256;
+    auto const nbCta = std::min<size_t>(divUp(nbPack, ctaSize), 4096);
+
+    convertData<Dst, Src><<<nbCta, ctaSize, 0, stream>>>(dst, src, size, scale);
+}
+
+#define INSTANTIATE_invokeConversion(Dst, Src)                                                                         \
+    template void invokeConversion<Dst, Src>(                                                                          \
+        Dst * dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream)
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, half);
+INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
+#undef INSTANTIATE_invokeConversion
 
 } // namespace kernels
 } // namespace tensorrt_llm

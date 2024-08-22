@@ -16,25 +16,61 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cstdlib>
 
 namespace tensorrt_llm::common
 {
 
+static std::optional<int32_t> getIntEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    int32_t const val = std::stoi(env);
+    if (val <= 0)
+    {
+        return std::nullopt;
+    }
+    return {val};
+};
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
-    char const* force_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
-    static bool forceXQA = false;
-    if (force_xqa_env_var != nullptr)
+    static bool const forceXQA = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0);
+    return forceXQA;
+}
+
+std::optional<bool> getEnvEnableXQAJIT()
+{
+    static bool init = false;
+    static bool exists = false;
+    static bool enableXQAJIT = false;
+    if (!init)
     {
-        if (force_xqa_env_var[0] == '1' && force_xqa_env_var[1] == '\0')
+        init = true;
+        char const* enable_xqa_jit_var = std::getenv("TRTLLM_ENABLE_XQA_JIT");
+        if (enable_xqa_jit_var)
         {
-            forceXQA = true;
+            exists = true;
+            if (enable_xqa_jit_var[0] == '1' && enable_xqa_jit_var[1] == '\0')
+            {
+                enableXQAJIT = true;
+            }
         }
     }
-    return forceXQA;
+    if (exists)
+    {
+        return enableXQAJIT;
+    }
+    else
+    {
+        return std::nullopt;
+    }
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
@@ -75,6 +111,50 @@ int getEnvMmhaBlocksPerSequence()
         }
     }
     return mmhaBlocksPerSequence;
+}
+
+int getEnvMmhaKernelBlockSize()
+{
+    static bool init = false;
+    static int mmhaKernelBlockSize = 0;
+    if (!init)
+    {
+        init = true;
+        char const* mmhaKernelBlockSizeEnv = std::getenv("TRTLLM_MMHA_KERNEL_BLOCK_SIZE");
+        if (mmhaKernelBlockSizeEnv)
+        {
+            mmhaKernelBlockSize = std::atoi(mmhaKernelBlockSizeEnv);
+            if (mmhaKernelBlockSize <= 0)
+            {
+                TLLM_LOG_WARNING("Invalid value for TRTLLM_MMHA_KERNEL_BLOCK_SIZE. Will use default values instead!");
+            }
+        }
+    }
+    return mmhaKernelBlockSize;
+}
+
+bool getEnvEnableFDL()
+{
+    static bool init = false;
+    static bool enableFDL = false;
+    if (!init)
+    {
+        init = true;
+        // FDL only available when arch >= 90
+        if (getSMVersion() >= 90)
+        {
+            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
+            if (enable_fdl)
+            {
+                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
+                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
+                {
+                    enableFDL = true;
+                }
+            }
+        }
+    }
+    return enableFDL;
 }
 
 } // namespace tensorrt_llm::common

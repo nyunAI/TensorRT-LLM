@@ -17,72 +17,53 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/layers/baseSamplingLayer.h"
+#include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/runtime/common.h"
 
-namespace tc = tensorrt_llm::common;
-
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 //! \brief Layer to randomly sample tokens from TopP logits.
 //! Layer expects probs precomputed in "logits" tensor
 template <typename T>
-class TopPSamplingLayer : public BaseSamplingLayer<T>
+class TopPSamplingLayer : public BaseLayer
 {
+    using Base = BaseLayer;
+
 public:
-    using Base = BaseSamplingLayer<T>;
-    using SetupParams = typename Base::SetupParams;
-    using ForwardParams = typename Base::ForwardParams;
+    TopPSamplingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager,
+        bool isDeterministic = true, bool isAirTopP = true);
 
-    TopPSamplingLayer(std::size_t maxBatchSize, std::size_t vocabSize, std::size_t vocabSizePadded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop, bool isDeterministic = true);
-    ~TopPSamplingLayer();
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    void setup(std::size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
-    void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
-
-    bool const* getSkipDecodeHost() const
-    {
-        return mSkipDecodeHost;
-    }
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 protected:
-    uint32_t* mRuntimeTopKDevice = nullptr;
-    float* mRuntimeTopPDevice = nullptr;
-    float mRuntimeMaxTopP{0.f};
-    float* mInitialTopPDevice = nullptr;
-    float* mTopPDecayDevice = nullptr;
-    float* mTopPMinDevice = nullptr;
-    int32_t* mTopPResetIdsDevice = nullptr;
-    void* mSetupWorkspaceDevice = nullptr;
+    TensorPtr mRuntimeTopKDevice;
+    TensorPtr mRuntimeTopPDevice;
+    TensorPtr mInitialTopPDevice;
+    TensorPtr mTopPDecayDevice;
+    TensorPtr mTopPMinDevice;
+    TensorPtr mTopPResetIdsDevice;
+    BufferPtr mSetupWorkspaceDevice;
 
-    int32_t* mTopPIdValsDevice = nullptr;
-    int32_t* mTopPOffsetDevice = nullptr;
-    int32_t* mBeginTopPOffsetDevice = nullptr;
-    bool* mSkipDecodeDevice = nullptr;
-    bool* mSkipDecodeHost = nullptr;
-    bool mIsDeterministic = true;
-    int mAirTopPBlockNum;
+    TensorPtr mSkipDecodeDevice;
+    TensorPtr mSkipDecodeHost;
+    runtime::SizeType32 mAirTopPBlockNum{0};
+    size_t mWorkspaceSize{0};
 
-    using Base::mMaxBatchSize;
-    using Base::mVocabSize;
-    using Base::mVocabSizePadded;
+    cudaDeviceProp mDeviceProp;
+    bool mIsDeterministic{true};
+    bool mIsAirTopP{false};
 
-    using Base::mSamplingWorkspaceSize;
-    using Base::mAllocatedSize;
-
-    using Base::mStream;
-    using Base::mAllocator;
-    using Base::mCudaDeviceProp;
+    using Base::mDecoderDomain;
 
 private:
-    void allocateBuffer(std::size_t batchSize);
-    void freeBuffer();
+    void allocateBuffer(runtime::SizeType32 batchSize);
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

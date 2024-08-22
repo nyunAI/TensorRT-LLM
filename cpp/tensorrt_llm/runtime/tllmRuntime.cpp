@@ -14,31 +14,34 @@
  * limitations under the License.
  */
 #include "tllmRuntime.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/common/safetensors.h"
 #include "tllmLogger.h"
 
 #include <limits>
 #include <type_traits>
 
 using namespace tensorrt_llm::runtime;
+using TensorMap = StringPtrMap<ITensor>;
 
 namespace
 {
-using DimType = std::remove_reference_t<decltype(std::declval<nvinfer1::Dims>().d[0])>;
-static_assert(sizeof(SizeType) >= sizeof(DimType), "SizeType is too small");
-static_assert(std::is_signed<SizeType>::value, "SizeType must be signed");
+static_assert(std::is_signed<SizeType32>::value, "SizeType32 must be signed");
 
 nvinfer1::Dims shapeToDims(std::vector<std::size_t> const& shape)
 {
     TLLM_CHECK(shape.size() <= nvinfer1::Dims::MAX_DIMS);
     nvinfer1::Dims dims;
-    auto constexpr dim_max = std::numeric_limits<DimType>::max();
+    auto constexpr dim_max = std::numeric_limits<ITensor::DimType64>::max();
     dims.nbDims = static_cast<std::int32_t>(shape.size());
     for (std::size_t i = 0; i < shape.size(); ++i)
     {
         // shape[i] >= 0 because it has unsigned type. Check upper bound:
         TLLM_CHECK(shape[i] <= static_cast<std::size_t>(dim_max));
-        dims.d[i] = static_cast<DimType>(shape[i]);
+        dims.d[i] = static_cast<ITensor::DimType64>(shape[i]);
     }
     return dims;
 }
@@ -57,31 +60,111 @@ std::vector<std::size_t> dimsToShape(nvinfer1::Dims const& dims)
 
 tensorrt_llm::runtime::TllmLogger defaultLogger{};
 
+class StreamReader final : public nvinfer1::IStreamReader
+{
+public:
+    StreamReader(std::filesystem::path fp)
+    {
+        mFile.open(fp.string(), std::ios::binary | std::ios::in);
+        TLLM_CHECK_WITH_INFO(mFile.good(), std::string("Error opening engine file: " + fp.string()));
+    }
+
+    virtual ~StreamReader()
+    {
+        if (mFile.is_open())
+        {
+            mFile.close();
+        }
+    }
+
+    int64_t read(void* destination, int64_t nbBytes) final
+    {
+        if (!mFile.good())
+        {
+            return -1;
+        }
+        mFile.read(static_cast<char*>(destination), nbBytes);
+        return mFile.gcount();
+    }
+
+    std::ifstream mFile;
+};
+
+void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPercent)
+{
+    if (gpuWeightsPercent < 1)
+    {
+        int64_t streamableSize = engine.getStreamableWeightsSize();
+        int64_t budget = gpuWeightsPercent * streamableSize;
+        TLLM_LOG_INFO("Set gpu weights percent to %f, which is %lld bytes. Valid range: %lld bytes - %lld bytes.",
+            gpuWeightsPercent, budget, 0, streamableSize);
+        engine.setWeightStreamingBudgetV2(budget);
+    }
+}
 } // namespace
 
-TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger)
+TllmRuntime::TllmRuntime(
+    RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
-    , mBufferManager{mStream}
-    , mRuntime{nvinfer1::createInferRuntime(logger)}
-    , mEngine{mRuntime->deserializeCudaEngine(engineData, engineSize)}
+    , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
+    , mRuntime{nvinfer1::createInferRuntime(logger ? *logger : defaultLogger)}
+    , mUseShapeInference{useShapeInference}
 {
-    TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine");
-    auto const devMemorySize = mEngine->getDeviceMemorySize();
-    mEngineBuffer = mBufferManager.gpu(devMemorySize);
-}
+    switch (rawEngine.getType())
+    {
+    case RawEngine::Type::FilePath:
+    {
+        auto reader = StreamReader(rawEngine.getPath());
+        mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        break;
+    }
+    case RawEngine::Type::AddressWithSize:
+        mEngine.reset(mRuntime->deserializeCudaEngine(rawEngine.getAddress(), rawEngine.getSize()));
+        break;
+    case RawEngine::Type::HostMemory:
+        mEngine.reset(
+            mRuntime->deserializeCudaEngine(rawEngine.getHostMemory()->data(), rawEngine.getHostMemory()->size()));
+        break;
+    default: TLLM_THROW("Unsupported raw engine type.");
+    }
 
-TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize)
-    : TllmRuntime{engineData, engineSize, defaultLogger}
-{
+    TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
+    mEngineInspector.reset(mEngine->createEngineInspector());
+
+    setWeightStreaming(getEngine(), gpuWeightsPercent);
+
+    auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
+    mEngineBuffer = mBufferManager.gpu(devMemorySize);
+
+    // Print context memory size for CI/CD to track.
+    TLLM_LOG_INFO("[MemUsageChange] Allocated %.2f MiB for execution context memory.",
+        static_cast<double>(devMemorySize) / 1048576.0);
 }
 
 nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
 {
     TLLM_CHECK(0 <= profileIndex && profileIndex < mEngine->getNbOptimizationProfiles());
     mContexts.emplace_back(mEngine->createExecutionContextWithoutDeviceMemory());
+    if (!mContexts.back())
+    {
+        if (mEngine->getStreamableWeightsSize() > 0)
+        {
+            TLLM_THROW("Failed to allocate memory for weights. Please try reducing --gpu_weights_percent.");
+        }
+        else
+        {
+            TLLM_THROW("Internal Error: Failed to create an execution context.");
+        }
+    }
     auto& context = *mContexts.back();
-    context.setDeviceMemory(mEngineBuffer->data());
+    context.setDeviceMemoryV2(mEngineBuffer->data(), static_cast<int64_t>(mEngineBuffer->getCapacity()));
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
+    // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
+    if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
+    {
+        TLLM_LOG_INFO(
+            "The engine was built with kDETAILED profiling verbosity, which may result in small overheads at runtime.");
+    }
     return context;
 }
 
@@ -94,30 +177,37 @@ void TllmRuntime::clearContexts()
     mContexts.clear();
 }
 
-bool TllmRuntime::executeContext(SizeType contextIndex) const
+bool TllmRuntime::executeContext(SizeType32 contextIndex) const
 {
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     return context.enqueueV3(mStream->get());
 }
 
-void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensorMap)
+void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
     {
-        auto const name = mEngine->getIOTensorName(i);
+        char const* name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
         {
             auto pos = tensorMap.find(name);
-            if (pos == tensorMap.end())
+            auto posWeight = mManagedWeightsMap.find(name);
+            if (pos == tensorMap.end() && posWeight == mManagedWeightsMap.end())
             {
                 auto expectedShape = mEngine->getTensorShape(name);
                 TLLM_THROW(
                     "Input tensor '%s' not found; expected shape: %s", name, ITensor::toString(expectedShape).c_str());
             }
-            auto const& tensor = pos->second;
+            if (posWeight != mManagedWeightsMap.end() && mSetWeights.count(contextIndex) > 0)
+            {
+                continue; // This input tensor is a managed weight, and we have already set it in a previous call.
+            }
+
+            auto const& tensor = pos == tensorMap.end() ? posWeight->second : pos->second;
             auto const tensorDtype = tensor->getDataType();
             auto const engineDtype = mEngine->getTensorDataType(name);
             // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
@@ -126,23 +216,17 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
                 "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
                 static_cast<std::int32_t>(tensorDtype));
 
-            auto const shapeExpected = mEngine->getTensorShape(name);
-            auto const shapeProvided = tensor->getShape();
-            TLLM_CHECK_WITH_INFO(shapeExpected.nbDims == shapeProvided.nbDims, "%s: expected %d dims, provided %d dims",
-                name, shapeExpected.nbDims, shapeProvided.nbDims);
-            for (SizeType j = 0; j < shapeExpected.nbDims; ++j)
+            auto const tensorShape = tensor->getShape();
+            auto const setInputShapeSuccess = context.setInputShape(name, tensorShape);
+            if (!setInputShapeSuccess)
             {
-                auto const dimExpected = shapeExpected.d[j];
-                auto const dimProvided = shapeProvided.d[j];
-                if (dimExpected >= 0 && dimExpected != dimProvided)
-                {
-                    TLLM_LOG_WARNING(
-                        "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, j, dimExpected, j, dimProvided);
-                }
+                auto const minShape = mEngine->getProfileShape(name, contextIndex, nvinfer1::OptProfileSelector::kMIN);
+                auto const maxShape = mEngine->getProfileShape(name, contextIndex, nvinfer1::OptProfileSelector::kMAX);
+
+                TLLM_THROW("Tensor '%s' has invalid shape %s, expected in range min %s, max %s", name,
+                    ITensor::toString(tensorShape).c_str(), ITensor::toString(minShape).c_str(),
+                    ITensor::toString(maxShape).c_str());
             }
-            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided),
-                "Tensor '%s' has invalid shape %s, expected %s", name, ITensor::toString(shapeProvided).c_str(),
-                ITensor::toString(shapeExpected).c_str());
             auto* const data = tensor->data();
             if (data)
             {
@@ -161,6 +245,8 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
         }
     }
 
+    mSetWeights.insert(contextIndex);
+    if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
         char const* missing;
@@ -180,10 +266,12 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
         TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
         TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
+void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -191,7 +279,6 @@ void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
         {
-            auto const dims = context.getTensorShape(name);
             auto const engineDtype = mEngine->getTensorDataType(name);
             auto pos = tensorMap.find(name);
             if (pos != tensorMap.end())
@@ -204,20 +291,75 @@ void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
                     "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
                     static_cast<std::int32_t>(tensorDtype));
 
-                tensor->reshape(dims);
+                if (mUseShapeInference)
+                {
+                    auto const dims = context.getTensorShape(name);
+                    tensor->reshape(dims);
+                }
                 context.setTensorAddress(name, tensor->data());
             }
-            else
+            else if (mUseShapeInference)
             {
+                auto const dims = context.getTensorShape(name);
                 auto tensor = ITensor::SharedPtr(mBufferManager.gpu(dims, engineDtype));
                 tensorMap.insert(pos, std::make_pair(name, tensor));
                 context.setTensorAddress(name, tensor->data());
             }
+            else
+            {
+                TLLM_THROW("Tensor %s is not found in tensorMap and shape inference is not allowed", name);
+            }
         }
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 CudaStream const& TllmRuntime::getStream() const
 {
     return *mStream;
+}
+
+bool TllmRuntime::hasLayerProfiler(SizeType32 contextId) const
+{
+    return mContexts[contextId]->getProfiler() != nullptr;
+}
+
+void TllmRuntime::setLayerProfiler()
+{
+    mLayerProfiler.reset(new LayerProfiler);
+    for (auto& context : mContexts)
+    {
+        context->setProfiler(mLayerProfiler.get());
+        context->setEnqueueEmitsProfile(false);
+    }
+}
+
+std::string TllmRuntime::getLayerProfileInfo() const
+{
+    TLLM_CHECK(mLayerProfiler);
+    return mLayerProfiler->getLayerProfile();
+}
+
+void TllmRuntime::reportToProfiler(SizeType32 contextId)
+{
+    mContexts[contextId]->reportToProfiler();
+}
+
+void TllmRuntime::loadManagedWeights(std::string const& weightsPath)
+{
+    auto& engine = getEngine();
+    auto& manager = getBufferManager();
+
+    std::shared_ptr<common::safetensors::ISafeTensor> managed_weights
+        = common::safetensors::ISafeTensor::open(weightsPath.c_str());
+    for (auto const& name : managed_weights->keys())
+    {
+        TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
+        auto const weight = managed_weights->getTensor(name.c_str());
+        TLLM_CHECK(weight->dtype() == engine.getTensorDataType(name.c_str()));
+        auto weightsDevice
+            = std::shared_ptr<ITensor>{manager.allocate(MemoryType::kGPU, weight->trtDims(), weight->dtype())};
+        manager.copy(weight->data(), *weightsDevice, MemoryType::kCPU);
+        mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
+    }
 }

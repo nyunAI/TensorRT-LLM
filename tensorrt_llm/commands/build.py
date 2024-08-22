@@ -20,37 +20,41 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
-from typing import Dict, Union
+from typing import Optional, Union
 
-import safetensors
 import torch
 
-from .._common import check_max_num_tokens
-from .._utils import str_dtype_to_torch
-from ..auto_parallel.config import _cluster_infos, infer_cluster_key
-from ..builder import BuildConfig, Engine, build
-from ..logger import logger
-from ..models import MODEL_MAP, PretrainedConfig
-from ..models.modeling_utils import WEIGHT_LOADER_MODELS, optimize_model
-from ..plugin import PluginConfig, add_plugin_argument
-from ..quantization import QuantMode
-from ..quantization.mode import FP8, W4A8_AWQ, W4A16, W4A16_AWQ, W8A16
+from tensorrt_llm.auto_parallel import infer_cluster_config
+from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
+from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.builder import BuildConfig, Engine, build
+from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--checkpoint_dir', type=str, default=None)
     parser.add_argument('--model_config', type=str, default=None)
     parser.add_argument('--build_config', type=str, default=None)
     parser.add_argument('--model_cls_file', type=str, default=None)
     parser.add_argument('--model_cls_name', type=str, default=None)
     parser.add_argument(
-        '--timing_cache',
+        '--input_timing_cache',
         type=str,
-        default='model.cache',
+        default=None,
         help=
-        'The path of to read timing cache from, will be ignored if the file does not exist'
+        'The path to read timing cache, will be ignored if the file does not exist'
     )
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help='The path to write timing cache')
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--profiling_verbosity',
@@ -67,18 +71,43 @@ def parse_arguments():
         '--output_dir',
         type=str,
         default='engine_outputs',
-        help=
-        'The path to save the serialized engine files, timing cache file and model configs'
-    )
+        help='The path to save the serialized engine files and model configs')
     parser.add_argument('--workers',
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=1)
-    parser.add_argument('--max_input_len', type=int, default=1024)
-    parser.add_argument('--max_output_len', type=int, default=1024)
+    parser.add_argument(
+        '--max_batch_size',
+        type=int,
+        default=256,
+        help="Max number of requests that the engine can handle.")
+    parser.add_argument('--max_input_len',
+                        type=int,
+                        default=1024,
+                        help="Max input length of one request.")
+    parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=None,
+        help="Max total length of one request, including prompt and outputs. "
+        "If unspecified, will try to deduce from the model config.")
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=None)
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=8192,
+        help="Max number of batched input tokens after padding is removed "
+        "(triggered by `--remove_input_padding`) in each batch.")
+    parser.add_argument(
+        '--opt_num_tokens',
+        type=int,
+        default=None,
+        help='It equals to max_batch_size*max_beam_width by default, set this '
+        'value as close as possible to the actual number of tokens on your workload. '
+        'Note that this argument might be removed in the future.')
+    parser.add_argument('--cp_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -90,11 +119,18 @@ def parse_arguments():
         'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
     )
     parser.add_argument(
-        '--use_fused_mlp',
-        default=False,
-        action='store_true',
+        '--kv_cache_type',
+        default=argparse.SUPPRESS,
+        type=KVCacheType,
         help=
-        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
+        'Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed.'
+    )
+    parser.add_argument(
+        '--paged_kv_cache',
+        type=str,
+        default=argparse.SUPPRESS,
+        help=
+        'Deprecated. Set this option to enable is equvilient to `--kv_cache_type paged` for transformer based models.'
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -109,16 +145,14 @@ def parse_arguments():
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
-    parser.add_argument('--strongly_typed', action='store_true', default=False)
+
     parser.add_argument('--builder_opt', type=int, default=None)
+    parser.add_argument('--builder_force_num_profiles', type=int, default=None)
     parser.add_argument('--logits_dtype',
                         type=str,
                         default=None,
                         choices=['float16', 'float32'])
-    parser.add_argument('--weight_only_precision',
-                        type=str,
-                        default=None,
-                        choices=['int8', 'int4'])
+    parser.add_argument('--weight_sparsity', default=False, action='store_true')
     parser.add_argument(
         '--max_draft_len',
         type=int,
@@ -126,7 +160,34 @@ def parse_arguments():
         help=
         'Maximum lengths of draft tokens for speculative decoding target model.'
     )
-    parser.add_argument('--world_size',
+    parser.add_argument(
+        '--lora_dir',
+        type=str,
+        default=None,
+        nargs="+",
+        help="The directory of LoRA weights. "
+        "Use config from the first directory if multiple directories are provided."
+    )
+    parser.add_argument('--lora_ckpt_source',
+                        type=str,
+                        default="hf",
+                        choices=["hf", "nemo"],
+                        help="The source of lora checkpoint.")
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=LoraManager.LORA_MODULE_IDS.keys(),
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
+    parser.add_argument(
+        '--max_lora_rank',
+        type=int,
+        default=64,
+        help='maximum lora rank for different lora modules. '
+        'It is used to compute the workspace size of lora plugin.')
+    parser.add_argument('--auto_parallel',
                         type=int,
                         default=1,
                         help='MPI world size for auto parallel.')
@@ -141,9 +202,60 @@ def parse_arguments():
         '--cluster_key',
         type=str,
         default=None,
-        choices=_cluster_infos.keys(),
+        choices=cluster_infos.keys(),
         help=
         'Unique name for target GPU type. Inferred from current GPU type if not specified.'
+    )
+    parser.add_argument(
+        '--strip_plan',
+        default=False,
+        action='store_true',
+        help=
+        'Whether to strip weights from the final TRT engine under the assumption that the refit weights will be identical to those provided at build time.'
+    )
+    parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=1024,
+        help=
+        'Specify max encoder input length when using enc-dec models. Set max_input_len to 1 to start generation from decoder_start_token_id of length 1.'
+    )
+    parser.add_argument(
+        '--visualize_network',
+        default=False,
+        action='store_true',
+        help=
+        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
+    )
+    parser.add_argument(
+        '--dry_run',
+        default=False,
+        action='store_true',
+        help=
+        'Run through the build process except the actual Engine build for debugging. '
+    )
+    parser.add_argument('--speculative_decoding_mode',
+                        default=None,
+                        choices=[
+                            "draft_tokens_external",
+                            "lookahead_decoding",
+                            "medusa",
+                            "explicit_draft_tokens",
+                        ],
+                        help='Mode of speculative decoding.')
+    parser.add_argument(
+        '--weight_streaming',
+        default=False,
+        action='store_true',
+        help=
+        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
+    parser.add_argument(
+        '--fast_build',
+        default=False,
+        action='store_true',
+        help=
+        'Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization.',
     )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
@@ -154,227 +266,84 @@ def parse_arguments():
         args.gather_context_logits = True
         args.gather_generation_logits = True
 
+    if args.gather_context_logits and args.max_draft_len > 0:
+        raise RuntimeError(
+            "Gather context logits is not support with draft len > 0. "
+            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
+        )
     return args
 
 
-def preprocess_model_config(model_config, **kwargs):
-    if model_config.architecture in WEIGHT_LOADER_MODELS:
-        model_config.mapping.tp_size = kwargs['tp_size']
-        model_config.mapping.pp_size = kwargs['pp_size']
-        model_config.mapping.world_size = kwargs['tp_size'] * kwargs['pp_size']
+def build_model(
+    build_config: BuildConfig,
+    rank: int = 0,
+    ckpt_dir: str = None,
+    model_config: Union[str, PretrainedConfig] = None,
+    model_cls=None,
+    dry_run:
+    bool = False,  # return the modified BuildConfig without actually building the engine
+    **kwargs
+) -> Union[Engine, BuildConfig]:
 
+    model_config = copy.deepcopy(model_config)
 
-def build_model(build_config: BuildConfig,
-                rank: int = 0,
-                ckpt_dir: str = None,
-                model_config: Union[str, PretrainedConfig] = None,
-                weights=None,
-                model_cls=None,
-                **kwargs) -> Engine:
-    if ckpt_dir is not None:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-    else:
-        assert model_config is not None
-        if isinstance(model_config, PretrainedConfig):
-            model_config = model_config
-        else:
-            model_config = PretrainedConfig.from_json_file(model_config)
-
-    preprocess_model_config(model_config, **kwargs)
-
-    logits_dtype = kwargs.pop('logits_dtype', None)
+    logits_dtype = kwargs.get('logits_dtype')
     if logits_dtype is not None:
         model_config.logits_dtype = logits_dtype
 
-    model_config.use_prompt_tuning = build_config.max_prompt_embedding_table_size > 0
-
-    weight_only_precision = kwargs.pop('weight_only_precision', None)
-    if model_config.quant_mode == QuantMode(
-            0) and weight_only_precision is not None:
-        if weight_only_precision == 'int4':
-            model_config.quant_mode = QuantMode.use_weight_only(
-                use_int4_weights=True)
-            model_config.quantization.quant_algo = W4A16
-        else:
-            model_config.quant_mode = QuantMode.use_weight_only(
-                use_int4_weights=False)
-            model_config.quantization.quant_algo = W8A16
-
     architecture = model_config.architecture
-
-    if model_cls is None:
-        if architecture not in MODEL_MAP:
-            raise RuntimeError(
-                f'Unsupported model architecture: {architecture}')
-        model_cls = MODEL_MAP[architecture]
-
+    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
+        "StreamingLLM is only supported in the llama model."
     real_rank = rank
+
+    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
+        build_config.plugin_config.reduce_fusion = False
+
+    model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
-        rank = 0
+        assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
+            "You must convert to full model with TP=1&&PP=1 to use auto parallel planner"
+        #TODO: TRTLLM-193 remove this after the new build API for autopp is done
+        rank = 0  # This is a WAR to construct a whole model and load all the weights before auto parallel
     else:
         assert rank < model_config.mapping.world_size
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
 
-    model = model_cls.from_config(rank_config)
-    if ckpt_dir is not None:
-        if model_config.architecture in WEIGHT_LOADER_MODELS:
-            model_path = os.path.join(ckpt_dir, f'rank0.safetensors')
-        else:
-            model_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
+    if model_cls is None:
+        assert architecture in MODEL_MAP, \
+            f"Unsupported model architecture: {architecture}"
+        model_cls = MODEL_MAP[architecture]
+    if ckpt_dir is None:
+        model = model_cls(rank_config)
+    else:
+        model = model_cls.from_checkpoint(ckpt_dir, config=rank_config)
+    is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
 
-        if os.path.isfile(model_path):
-            weights = {}
-            with safetensors.safe_open(model_path, framework='pt',
-                                       device='cpu') as f:
-                for key in f.keys():
-                    weights[key] = f.get_tensor(key)
-        else:
-            logger.warning(
-                f"Cannot find {model_path}. Use dummy model weights.")
+    if build_config.plugin_config.lora_plugin is not None:
+        lora_config = LoraConfig(lora_dir=kwargs['lora_dir'] or [],
+                                 lora_ckpt_source=kwargs['lora_ckpt_source'],
+                                 max_lora_rank=kwargs['max_lora_rank'])
+        if kwargs['lora_target_modules'] is not None:
+            # command line options is preferred over the modules in the lora dir
+            lora_config.lora_target_modules = kwargs['lora_target_modules']
+        build_config.lora_config = lora_config
 
-    if weights is not None:
-        preprocess_weights(weights, rank_config)
-        model.load(weights)
-
-    if model.config.quantization.quant_algo == FP8 or model.config.quantization.kv_cache_quant_algo == FP8:
-        build_config.strongly_typed = True
-
-    if hasattr(model.config, 'max_medusa_token_len'):
-        build_config.max_draft_len = model.config.max_medusa_token_len
-
-    use_fused_mlp = kwargs.pop('use_fused_mlp', False)
-    use_auto_parallel = build_config.auto_parallel_config.enabled
-    model = optimize_model(model,
-                           use_fused_mlp=use_fused_mlp
-                           and not use_auto_parallel)
-
-    if use_auto_parallel:
+    build_config.use_fused_mlp = kwargs.get('use_fused_mlp', False)
+    # tells the low level build api to only build rank-th shard of the model
+    if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank
 
+    if is_checkpoint_pruned or kwargs.pop('strip_plan', False):
+        build_config.use_strip_plan = True
+    build_config.use_refit = kwargs.get('refit', False)
+
+    if dry_run:
+        return build_config
+
     return build(model, build_config)
-
-
-def preprocess_weights(
-        weights: Dict[str, torch.Tensor],
-        model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
-    quant_algo = model_config.quantization.quant_algo
-    kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
-
-    # INT4_AWQ
-    if quant_algo == W4A8_AWQ or quant_algo == W4A16_AWQ:
-        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-        for name, param in weights.items():
-            if name.endswith('weight') and param.dtype == torch.int8:
-                dtype = torch.float16
-                if model_config.dtype == "bfloat16":
-                    dtype = torch.bfloat16
-                weights[name] = preprocessor(param.T.contiguous(),
-                                             torch.quint4x2).view(dtype)
-            if name.endswith('weights_scaling_factor'):
-                weights[name] = param.T.contiguous().to(
-                    str_dtype_to_torch(model_config.dtype))
-            if name.endswith('prequant_scaling_factor'):
-                weights[name] = param.reshape(1, -1)
-            if model_config.mapping.tp_rank > 0:
-                if name.endswith('attention.dense.bias') or name.endswith(
-                        'mlp.proj.bias'):
-                    weights[name] = torch.zeros_like(param)
-
-        if quant_algo == W4A8_AWQ:
-            for name in list(weights):
-                if name.endswith('weights_scaling_factor'):
-                    activation_scaling_factor = weights.pop(
-                        name.replace('weights_scaling_factor',
-                                     'activation_scaling_factor'))
-                    weights_scaling_factor_2 = weights.pop(
-                        name.replace('weights_scaling_factor',
-                                     'weights_scaling_factor_2'))
-                    weights[name] /= weights_scaling_factor_2
-                    weights[name.replace(
-                        'weights_scaling_factor',
-                        'prequant_scaling_factor')] /= activation_scaling_factor
-                    weights[name.replace(
-                        'weights_scaling_factor', 'alpha'
-                    )] = activation_scaling_factor * weights_scaling_factor_2
-
-    # FP8
-    elif quant_algo == FP8:
-        for name, param in weights.items():
-            if name.endswith('weight') and param.dtype == torch.int8:
-                weights[name] = param.view(torch.float8_e4m3fn)
-        # lm_head is not quantized to FP8
-        if "lm_head.weight" in weights:
-            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
-                model_config.dtype)
-            weights.pop('lm_head.weights_scaling_factor', None)
-            weights.pop('lm_head.activation_scaling_factor', None)
-
-    # Weight only 4bit
-    elif quant_algo == W4A16:
-        for name in list(weights):
-            if any([
-                    _name in name for _name in [
-                        'qkv.weight', 'dense.weight', 'fc.weight',
-                        'proj.weight', 'gate.weight'
-                    ]
-            ]) and weights[name].dtype != torch.int8:
-                processed_torch_weights, torch_weight_scales = \
-            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                weights[name].t().contiguous(), torch.quint4x2)
-                weights[name] = processed_torch_weights
-                weights[name.replace(
-                    '.weight', '.per_channel_scale')] = torch_weight_scales
-
-    # Weight only 8bit
-    elif quant_algo == W8A16:
-        for name in list(weights):
-            if any([
-                    _name in name for _name in [
-                        'qkv.weight', 'dense.weight', 'fc.weight',
-                        'proj.weight', 'gate.weight'
-                    ]
-            ]) and weights[name].dtype != torch.int8:
-                processed_torch_weights, torch_weight_scales = \
-            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                weights[name].t().contiguous(), torch.int8)
-                weights[name] = processed_torch_weights
-                weights[name.replace(
-                    '.weight', '.per_channel_scale')] = torch_weight_scales
-
-    # FP8 kv_cache_scaling_factor is always 1.0
-    if kv_cache_quant_algo == FP8:
-        for name, param in weights.items():
-            if name.endswith('kv_cache_scaling_factor'):
-                weights[name] = torch.tensor([1.0], dtype=torch.float32)
-
-    # If layer_norm bias is None. (For MPT)
-    if model_config.architecture == 'MPTForCausalLM':
-        update_dict = {}
-        for name, param in weights.items():
-            if 'input_layernorm.weight' in name and name.replace(
-                    'weight', 'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-            if 'post_layernorm.weight' in name and name.replace(
-                    'weight', 'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-            if 'ln_f.weight' in name and name.replace('weight',
-                                                      'bias') not in weights:
-                update_dict[name.replace('weight',
-                                         'bias')] = torch.zeros_like(param)
-        weights.update(update_dict)
-
-    # Parallel block rowlinear should not have duplicate bias.
-    if model_config.architecture == 'GPTJForCausalLM':
-        if model_config.mapping.tp_rank > 0:
-            for name, param in weights.items():
-                if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
-                    weights[name] = torch.zeros_like(param)
 
 
 def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
@@ -392,22 +361,14 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
     return True
 
 
-def parallel_build(ckpt_dir_or_model_config: str,
+def parallel_build(model_config: PretrainedConfig,
+                   ckpt_dir: Optional[str],
                    build_config: BuildConfig,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
-    ckpt_dir = ckpt_dir_or_model_config
-    if ckpt_dir_or_model_config.lower().endswith('.json'):
-        model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
-        ckpt_dir = None
-    else:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir_or_model_config, 'config.json'))
-
-    preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
         if model_config.mapping.world_size > 1:
@@ -462,38 +423,83 @@ def main():
 
     workers = min(torch.cuda.device_count(), args.workers)
 
+    if hasattr(args, 'paged_kv_cache'):
+        logger.warning(
+            'Option --paged_kv_cache is deprecated, use --kv_cache_type=paged/disabled instead.'
+        )
+
     plugin_config = PluginConfig.from_arguments(args)
+
+    if args.fast_build:
+        plugin_config.manage_weights = True
+
+    kwargs = {
+        'logits_dtype': args.logits_dtype,
+        'use_fused_mlp': plugin_config.use_fused_mlp,
+        'cp_size': args.cp_size,
+        'tp_size': args.tp_size,
+        'pp_size': args.pp_size,
+        'lora_dir': args.lora_dir,
+        'lora_ckpt_source': args.lora_ckpt_source,
+        'max_lora_rank': args.max_lora_rank,
+        'lora_target_modules': args.lora_target_modules,
+        'strip_plan': args.strip_plan,
+        'refit': False,
+    }
+    speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
+
+    ckpt_dir_or_model_config = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
+    if ckpt_dir_or_model_config.lower().endswith('.json'):
+        config_path = ckpt_dir_or_model_config
+        ckpt_dir = None
+    else:
+        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
+        ckpt_dir = ckpt_dir_or_model_config
+
+    model_config = PretrainedConfig.from_json_file(config_path)
+
+    # avoid ValueError if not supported quantization is chosen with use_fused_mlp
+    quant_algo = model_config.quantization.quant_algo
+    if quant_algo and quant_algo != QuantAlgo.FP8:
+        kwargs['use_fused_mlp'] = False
+
     if args.build_config is None:
-        args.max_num_tokens = check_max_num_tokens(
-            max_num_tokens=args.max_num_tokens,
-            max_batch_size=args.max_batch_size,
-            max_input_len=args.max_input_len,
-            remove_input_padding=(args.remove_input_padding == "enable"),
-            enable_context_fmha=(args.context_fmha == "enable"),
-            tokens_per_block=args.tokens_per_block)
+        if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
+            raise RuntimeError(
+                "multiple_profiles is enabled, while opt_num_tokens is set. "
+                "They are not supposed to be working in the same time for now.")
+        if args.cluster_key is not None:
+            cluster_config = dict(cluster_key=args.cluster_key)
+        else:
+            cluster_config = infer_cluster_config()
+
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
-                'max_output_len': args.max_output_len,
+                'max_seq_len': args.max_seq_len,
                 'max_batch_size': args.max_batch_size,
                 'max_beam_width': args.max_beam_width,
                 'max_num_tokens': args.max_num_tokens,
+                'opt_num_tokens': args.opt_num_tokens,
                 'max_prompt_embedding_table_size':
                 args.max_prompt_embedding_table_size,
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
-                'strongly_typed': args.strongly_typed,
+                'strongly_typed': True,
                 'builder_opt': args.builder_opt,
+                'force_num_profiles': args.builder_force_num_profiles,
+                'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
                 'max_draft_len': args.max_draft_len,
+                'speculative_decoding_mode': speculative_decoding_mode,
+                'input_timing_cache': args.input_timing_cache,
+                'output_timing_cache': args.output_timing_cache,
                 'auto_parallel_config': {
                     'world_size':
-                    args.world_size,
+                    args.auto_parallel,
                     'gpus_per_node':
                     args.gpus_per_node,
-                    'cluster_key':
-                    args.cluster_key or infer_cluster_key(),
                     'sharded_io_allowlist': [
                         'past_key_value_\\d+',
                         'present_key_value_\\d*',
@@ -501,23 +507,23 @@ def main():
                     'same_buffer_io': {
                         'past_key_value_(\\d+)': 'present_key_value_\\1',
                     },
+                    **cluster_config,
                 },
+                'dry_run': args.dry_run,
+                'visualize_network': args.visualize_network,
+                'max_encoder_input_len': args.max_encoder_input_len,
+                'weight_streaming': args.weight_streaming,
             },
             plugin_config=plugin_config)
+
+        if hasattr(args, 'kv_cache_type'):
+            build_config.update_from_dict({'kv_cache_type': args.kv_cache_type})
     else:
         build_config = BuildConfig.from_json_file(args.build_config,
                                                   plugin_config=plugin_config)
 
-    source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
-    kwargs = {
-        'logits_dtype': args.logits_dtype,
-        'use_fused_mlp': args.use_fused_mlp,
-        'weight_only_precision': args.weight_only_precision,
-        'tp_size': args.tp_size,
-        'pp_size': args.pp_size,
-    }
-    parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+    parallel_build(model_config, ckpt_dir, build_config, args.output_dir,
+                   workers, args.log_level, model_cls, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

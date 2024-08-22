@@ -16,45 +16,90 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/allocator.h"
-#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
-namespace layers
+#include <utility>
+
+namespace tensorrt_llm::layers
 {
 
 class BaseLayer
 {
 public:
-    BaseLayer(cudaStream_t stream, std::shared_ptr<tensorrt_llm::common::IAllocator> allocator,
-        cudaDeviceProp* prop = nullptr)
-        : mStream(stream)
-        , mAllocator(std::move(allocator))
-        , mCudaDeviceProp(prop)
+    using SizeType32 = runtime::SizeType32;
+    using TokenIdType = runtime::TokenIdType;
+    using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
+    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+    BaseLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager)
+        : mBufferManager(bufferManager)
+        , mDecoderDomain(decoderDomain)
     {
     }
 
     virtual ~BaseLayer() = default;
 
-    virtual cudaStream_t getStream()
+    //! @returns cuda stream associated with layer
+    [[nodiscard]] cudaStream_t getStream() const noexcept
     {
-        return mStream;
+        return mBufferManager->getStream().get();
     }
 
-    virtual void setStream(cudaStream_t stream)
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] virtual size_t getWorkspaceSize() const noexcept
     {
-        mStream = stream;
+        return 0;
+    };
+
+    // clang-format off
+    //! \brief Virtual function to setup internal states of the layer with sampling params
+    //! specified in setupParams for the entries specified by batchSlots.
+    //! It updates data for new requests in internal tensors inplace.
+    //! Thus, it must be called only once for new requests.
+    //!
+    //! \param batchSize current batch size configured in the system
+    //! \param beamWidth current beam width configured in the system
+    //! \param batchSlots input buffer [maxBatchSize], address map of the new requests, in pinned memory
+    //! \param setupParams shared pointer to params inherited from BaseSetupParams
+    // clang-format on
+    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams)
+        = 0;
+
+    // clang-format off
+    //! \brief Virtual function to execute layer async on GPU.
+    //! There must be no stream synchronization inside this function.
+    //!
+    //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
+    //! \param inputs shared pointer to params inherited from BaseForwardParams
+    // clang-format on
+    virtual void forwardAsync(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+        = 0;
+
+    // clang-format off
+    //! \brief Virtual function to execute layer synchronously on CPU / GPU.
+    //! It is allowed (but not necassary) to synchronize on stream inside this function.
+    //! It is targeted mainly for prototyping.
+    //!
+    //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
+    //! \param inputs shared pointer to params inherited from BaseForwardParams
+    // clang-format on
+    virtual void forwardSync(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+    {
     }
 
 protected:
-    // device environments
-    cudaStream_t mStream;
-    std::shared_ptr<tensorrt_llm::common::IAllocator> mAllocator;
-    cudaDeviceProp* mCudaDeviceProp = nullptr;
+    // Buffer Manager
+    std::shared_ptr<runtime::BufferManager> mBufferManager;
 
-    bool mIsAllocateBuffer = false; // TODO to be deprecated
+    // Domain in which token decoding is computed
+    DecoderDomain mDecoderDomain;
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

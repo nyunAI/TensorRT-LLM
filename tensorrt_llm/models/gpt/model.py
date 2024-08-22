@@ -13,22 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import Optional, Union
 
-import tensorrt as trt
-
-from ..._common import default_net
-from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (Tensor, gather_last_token_logits,
-                           is_gated_activation, non_gated_version)
-from ...layers import (MLP, MOE, Attention, AttentionMaskType, AttentionParams,
-                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       LayerNorm, LoraParams, MoeConfig, PositionEmbeddingType,
-                       PromptTuningEmbedding)
+from ..._utils import pad_vocab_size
+from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
+                           send)
+from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, LayerNorm, MoeConfig,
+                       PositionEmbeddingType)
+from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
-from ...module import Module, ModuleList
+from ...module import Module
 from ...quantization import QuantMode
-from ..generation_mixin import GenerationMixin
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              QuantConfig, check_share_embedding)
+from .config import GPTConfig
+from .convert import (load_hf_gpt, load_weights_from_hf_model,
+                      load_weights_from_nemo)
 
 
 def MLPFactory(hidden_size,
@@ -39,112 +40,103 @@ def MLPFactory(hidden_size,
                moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
-               tp_rank=0,
+               mapping=Mapping(),
                quant_mode=QuantMode(0),
-               max_lora_rank=None):
+               inner_layernorm=False,
+               eps=1e-05):
     if moe_config.has_moe():
         return MOE(moe_config,
                    hidden_size,
                    ffn_hidden_size,
                    hidden_act,
-                   bias,
-                   dtype,
-                   tp_group,
-                   tp_size,
-                   tp_rank,
-                   quant_mode=quant_mode,
-                   max_lora_rank=max_lora_rank)
+                   mapping=mapping,
+                   bias=bias,
+                   dtype=dtype,
+                   tp_group=tp_group,
+                   tp_size=tp_size,
+                   quant_mode=quant_mode)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
-    return MLPClass(hidden_size,
-                    ffn_hidden_size,
-                    hidden_act,
-                    bias,
-                    dtype,
-                    tp_group,
-                    tp_size,
-                    quant_mode,
-                    max_lora_rank=max_lora_rank)
+    return MLPClass(
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias,
+        dtype,
+        tp_group,
+        tp_size,
+        quant_mode,
+        inner_layernorm=inner_layernorm,
+        eps=eps,
+    )
 
 
 class GPTDecoderLayer(Module):
 
-    def __init__(self,
-                 *,
-                 local_layer_idx,
-                 hidden_size,
-                 num_attention_heads,
-                 max_position_embeddings,
-                 num_layers,
-                 dtype=None,
-                 apply_query_key_layer_scaling=False,
-                 attention_mask_type=AttentionMaskType.causal,
-                 hidden_act='relu',
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 quant_mode=QuantMode(0),
-                 rotary_embedding_percentage=1.0,
-                 rotary_base=10000.0,
-                 rotary_scaling=None,
-                 inter_size=None,
-                 bias=True,
-                 num_kv_heads=None,
-                 moe_config: MoeConfig = MoeConfig(),
-                 tp_group=None,
-                 tp_size=1,
-                 tp_rank=0,
-                 max_lora_rank=None):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.max_position_embeddings = max_position_embeddings
-        self.num_layers = num_layers
-        self.dtype = dtype
-        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        self.attention_mask_type = attention_mask_type
-        self.hidden_act = hidden_act
-        self.position_embedding_type = position_embedding_type
-        self.tp_group = tp_group
-        self.tp_size = tp_size
-        self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
-                                         dtype=dtype)
+        self.layer_idx = layer_idx
+        self.config = config
 
+        tp_group = config.mapping.tp_group
+        tp_size = config.mapping.tp_size
+        tp_rank = config.mapping.tp_rank
+
+        self.input_layernorm = LayerNorm(normalized_shape=config.hidden_size,
+                                         eps=config.norm_epsilon,
+                                         dtype=config.dtype)
+
+        layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+        local_layer_idx = layer_idx - layers_range[0]
+        inner_layernorm = config.inner_layernorm if hasattr(
+            config, "inner_layernorm") else False
+        attention_head_size = config.head_size if hasattr(config,
+                                                          "head_size") else None
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_kv_heads=num_kv_heads,
-            max_position_embeddings=max_position_embeddings,
-            num_layers=num_layers,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            dtype=dtype,
-            attention_mask_type=attention_mask_type,
-            position_embedding_type=position_embedding_type,
-            rotary_embedding_percentage=rotary_embedding_percentage,
-            rotary_embedding_base=rotary_base,
-            rotary_embedding_scaling=rotary_scaling,
-            bias=bias,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            num_layers=config.num_hidden_layers,
+            q_scaling=config.q_scaling,
+            apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
+            dtype=config.dtype,
+            attention_mask_type=AttentionMaskType.causal,
+            attention_head_size=attention_head_size,
+            position_embedding_type=config.position_embedding_type,
+            rotary_embedding_percentage=config.rotary_pct,
+            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_scaling=config.rotary_scaling,
+            bias=config.bias,
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_mode=quant_mode,
-            max_lora_rank=max_lora_rank)
+            quant_mode=config.quant_mode,
+            qk_layernorm=config.qk_layernorm,
+            inner_layernorm=inner_layernorm,
+            eps=config.norm_epsilon)
 
-        if inter_size is None:
-            inter_size = hidden_size * 4
+        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+        self.norm_before_bmm1 = config.norm_before_bmm1 if hasattr(
+            config, "norm_before_bmm1") else False
 
-        self.mlp = MLPFactory(hidden_size=hidden_size,
-                              ffn_hidden_size=inter_size,
-                              hidden_act=hidden_act,
-                              dtype=dtype,
-                              bias=bias,
-                              moe_config=moe_config,
+        self.mlp = MLPFactory(hidden_size=config.hidden_size,
+                              ffn_hidden_size=mlp_hidden_size,
+                              hidden_act=config.hidden_act,
+                              dtype=config.dtype,
+                              bias=config.bias,
+                              moe_config=config.moe,
                               tp_group=tp_group,
                               tp_size=tp_size,
-                              tp_rank=tp_rank,
-                              quant_mode=quant_mode,
-                              max_lora_rank=max_lora_rank)
-        self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
-                                        dtype=dtype)
+                              mapping=config.mapping,
+                              quant_mode=config.quant_mode,
+                              inner_layernorm=inner_layernorm,
+                              eps=config.norm_epsilon)
+
+        self.post_layernorm = LayerNorm(normalized_shape=config.hidden_size,
+                                        eps=config.norm_epsilon,
+                                        dtype=config.dtype)
 
     def forward(self,
                 hidden_states: Tensor,
@@ -152,7 +144,8 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                spec_decoding_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -160,12 +153,15 @@ class GPTDecoderLayer(Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(hidden_states,
-                                          attention_mask=attention_mask,
-                                          use_cache=use_cache,
-                                          kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params,
-                                          lora_layer_params=lora_layer_params)
+        attention_output = self.attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
+            norm_before_bmm1=self.norm_before_bmm1)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -175,7 +171,8 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
 
@@ -186,77 +183,29 @@ class GPTDecoderLayer(Module):
 
 class GPTModel(Module):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype=None,
-                 mapping=Mapping(),
-                 apply_query_key_layer_scaling=False,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 rotary_embedding_percentage=1.0,
-                 rotary_base=10000.0,
-                 rotary_scaling=None,
-                 inter_size=None,
-                 bias=True,
-                 quant_mode=QuantMode(0),
-                 num_kv_heads=None,
-                 use_prompt_tuning=False,
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 moe_config=MoeConfig(),
-                 max_lora_rank=None):
+    def __init__(self, config: GPTConfig):
         super().__init__()
-        self.mapping = mapping
-        self.use_prompt_tuning = use_prompt_tuning
-        self.position_embedding_type = position_embedding_type
+        self.mapping = config.mapping
+        self.position_embedding_type = config.position_embedding_type
+        if config.mapping.is_first_pp_rank():
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
-        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(
-            vocab_size,
-            hidden_size,
-            dtype=dtype,
-            tp_size=mapping.tp_size if use_parallel_embedding else 1,
-            tp_group=mapping.tp_group if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
-        if position_embedding_type == PositionEmbeddingType.learned_absolute:
-            self.position_embedding = Embedding(max_position_embeddings,
-                                                hidden_size,
-                                                dtype=dtype)
+            self.embedding_scale = config.embedding_scale
 
-        layers_range = self.mapping.pp_layers(num_layers)
-        self.layers = ModuleList([
-            GPTDecoderLayer(
-                local_layer_idx=layer_idx - layers_range[0],
-                hidden_size=hidden_size,
-                num_attention_heads=num_heads,
-                max_position_embeddings=max_position_embeddings,
-                num_layers=num_layers,
-                dtype=dtype,
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                attention_mask_type=AttentionMaskType.causal,
-                hidden_act=hidden_act,
-                position_embedding_type=position_embedding_type,
-                rotary_embedding_percentage=rotary_embedding_percentage,
-                rotary_base=rotary_base,
-                rotary_scaling=rotary_scaling,
-                num_kv_heads=num_kv_heads,
-                tp_group=mapping.tp_group,
-                tp_size=mapping.tp_size,
-                tp_rank=mapping.tp_rank,
-                inter_size=inter_size,
-                bias=bias,
-                quant_mode=quant_mode,
-                moe_config=moe_config,
-                max_lora_rank=max_lora_rank,
-            ) for layer_idx in layers_range
-        ])
+            if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
+                self.position_embedding = Embedding(
+                    num_embeddings=config.max_position_embeddings,
+                    embedding_dim=config.hidden_size,
+                    dtype=config.dtype)
 
-        self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
+        self.layers = DecoderLayerList(GPTDecoderLayer, config)
+
+        if config.mapping.is_last_pp_rank():
+            self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
+                                  eps=config.norm_epsilon,
+                                  dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -265,287 +214,182 @@ class GPTModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                hidden_states=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                lora_params=None):
+                lora_params=None,
+                spec_decoding_params=None):
+        if self.mapping.is_first_pp_rank():
+            ptuning_args = [
+                prompt_embedding_table, prompt_tasks, prompt_vocab_size
+            ] if prompt_embedding_table is not None else []
+            hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            if self.embedding_scale is not None:
+                hidden_states *= self.embedding_scale
+            if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+                hidden_states = hidden_states + self.position_embedding(
+                    position_ids)
+        else:
+            hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
-                ] if self.use_prompt_tuning else []
-        hidden_states = self.vocab_embedding(input_ids, *args)
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            hidden_states = hidden_states + self.position_embedding(
-                position_ids)
-
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params,
+                                    lora_params=lora_params,
+                                    spec_decoding_params=spec_decoding_params)
         if use_cache:
-            presents = []
+            hidden_states, presents = hidden_states
 
-        for layer_idx, (layer, past) in enumerate(
-                zip(self.layers, kv_cache_params.past_key_value)):
-
-            lora_layer_params = None
-            if lora_params.lora_ranks is not None:
-                lora_layer_params = lora_params.get_layer_params(layer_idx)
-
-            hidden_states = layer(
-                hidden_states,
-                use_cache=use_cache,
-                attention_mask=attention_mask,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=kv_cache_params.
-                    host_max_attention_window_sizes,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    kv_cache_block_pointers=kv_cache_params.
-                    kv_cache_block_pointers,
-                    host_kv_cache_block_pointers=kv_cache_params.
-                    host_kv_cache_block_pointers,
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                lora_layer_params=lora_layer_params)
-
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
-
-        hidden_states = self.ln_f(hidden_states)
+        if self.mapping.is_last_pp_rank():
+            hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
         if use_cache:
             return (hidden_states, tuple(presents))
         return hidden_states
 
 
-class GPTLMHeadModel(GPTModel, GenerationMixin):
+class GPTForCausalLM(DecoderModelForCausalLM):
+    config_class = GPTConfig
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype,
-                 logits_dtype='float32',
-                 mapping=Mapping(),
-                 apply_query_key_layer_scaling=False,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 rotary_embedding_percentage=1.0,
-                 rotary_base=10000.0,
-                 rotary_scaling=None,
-                 inter_size=None,
-                 bias=True,
-                 quant_mode=QuantMode(0),
-                 num_kv_heads=None,
-                 use_prompt_tuning=False,
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 moe_config=MoeConfig(),
-                 share_embedding_table=False,
-                 max_lora_rank=None):
+    def __init__(self, config: GPTConfig):
+        transformer = GPTModel(config)
 
-        if isinstance(dtype, str):
-            self._kv_dtype = str_dtype_to_trt(dtype)
+        if config.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                               config.mapping.tp_size)
+            lm_head = ColumnLinear(config.hidden_size,
+                                   vocab_size_padded,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
         else:
-            assert isinstance(dtype, trt.DataType)
-            self._kv_dtype = dtype
+            lm_head = None
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_k": "k_proj",
+            "attn_v": "v_proj",
+            "attn_dense": "o_proj",
+            "mlp_h_to_4h": "c_fc",
+            "mlp_4h_to_h": "c_proj",
+        }
+        super().__init__(config, transformer, lm_head)
 
-        if share_embedding_table and mapping.tp_size > 1:
-            if (not use_parallel_embedding) or (use_parallel_embedding and
-                                                embedding_sharding_dim == 1):
-                raise NotImplementedError(
-                    'For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim = 0'
-                )
-
-        self._dtype = self._kv_dtype
-        self.quant_mode = quant_mode
-        if quant_mode.has_int8_kv_cache():
-            self._kv_dtype = str_dtype_to_trt('int8')
-        elif quant_mode.has_fp8_kv_cache():
-            self._kv_dtype = str_dtype_to_trt('fp8')
-
-        if isinstance(logits_dtype, str):
-            self._logits_dtype = str_dtype_to_trt(logits_dtype)
-        else:
-            assert isinstance(logits_dtype, trt.DataType)
-            self._logits_dtype = logits_dtype
-
-        self._num_layers = num_layers
-        self._num_heads = num_heads
-        self._hidden_size = hidden_size
-        self._vocab_size = vocab_size
-        self._tp_size = mapping.tp_size
-        self._num_kv_heads = num_kv_heads if num_kv_heads else num_heads
-
-        super().__init__(
-            num_layers=num_layers,
-            num_heads=num_heads,
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            hidden_act=hidden_act,
-            max_position_embeddings=max_position_embeddings,
-            dtype=dtype,
-            mapping=mapping,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            position_embedding_type=position_embedding_type,
-            rotary_embedding_percentage=rotary_embedding_percentage,
-            rotary_base=rotary_base,
-            rotary_scaling=rotary_scaling,
-            inter_size=inter_size,
-            bias=bias,
-            quant_mode=quant_mode,
-            num_kv_heads=num_kv_heads,
-            use_prompt_tuning=use_prompt_tuning,
-            use_parallel_embedding=use_parallel_embedding,
-            embedding_sharding_dim=embedding_sharding_dim,
-            moe_config=moe_config,
-            max_lora_rank=max_lora_rank,
-        )
-        vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-
-        share_weight = None
-        if share_embedding_table:
-            share_weight = self.vocab_embedding.weight
-        self.lm_head = ColumnLinear(hidden_size,
-                                    vocab_size_padded,
-                                    bias=False,
-                                    dtype=dtype,
-                                    tp_group=mapping.tp_group,
-                                    tp_size=mapping.tp_size,
-                                    gather_output=True,
-                                    share_weight=share_weight)
-
-    def forward(self,
-                input_ids: Tensor,
-                position_ids=None,
-                use_cache=False,
-                last_token_ids=None,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None,
-                prompt_embedding_table=None,
-                prompt_tasks=None,
-                prompt_vocab_size=None,
-                lora_params=None):
-
-        hidden_states = super().forward(input_ids, position_ids, use_cache,
-                                        attention_mask, kv_cache_params,
-                                        attention_params,
-                                        prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size, lora_params)
-
-        if use_cache:
-            hidden_states, presents = hidden_states
-
-        hidden_states = gather_last_token_logits(
-            hidden_states, last_token_ids,
-            default_net().plugin_config.remove_input_padding)
-
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
-        lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self._logits_dtype)
-
-        if use_cache:
-            if not default_net().plugin_config.paged_kv_cache:
-                for i, present in enumerate(presents):
-                    present.mark_output(f'present_key_value_{i}',
-                                        self._kv_dtype)
-            return (lm_logits, presents)
-
-        return lm_logits
-
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_seq_len,
-                       use_cache,
-                       max_beam_width: int = 1,
-                       max_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 0,
-                       gather_context_logits: bool = False,
-                       gather_generation_logits: bool = False,
-                       max_draft_len: int = 0,
-                       lora_target_modules: List[str] = None):
-        '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
-            ranges of the dimensions of when using TRT dynamic shapes.
-
-            @return: a list contains values which can be fed into the self.forward()
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a LLaMAForCausalLM object from give parameters
         '''
+        import transformers
 
-        # Prepare inputs
-        head_size = self._hidden_size // self._num_heads
-        num_heads_kv = self._num_kv_heads
-        remove_input_padding = default_net().plugin_config.remove_input_padding
-        use_gpt_attention_plugin = default_net(
-        ).plugin_config.gpt_attention_plugin
-        use_gemm_plugin = default_net().plugin_config.gemm_plugin
-        paged_kv_cache = default_net().plugin_config.paged_kv_cache
-        tokens_per_block = default_net().plugin_config.tokens_per_block
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
-        use_lora_plugin = default_net().plugin_config.lora_plugin
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
 
-        model_inputs = self.prepare_basic_inputs(
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            num_kv_heads=num_heads_kv,
-            head_size=head_size,
-            num_layers=self._num_layers,
-            kv_dtype=self._kv_dtype,
-            num_heads=self._num_heads,
-            dtype=self._dtype,
-            remove_input_padding=remove_input_padding,
-            use_gpt_attention_plugin=use_gpt_attention_plugin,
-            use_gemm_plugin=use_gemm_plugin,
-            use_custom_all_reduce=use_custom_all_reduce,
-            paged_kv_cache=paged_kv_cache,
-            tokens_per_block=tokens_per_block,
-            gather_context_logits=gather_context_logits,
-            gather_generation_logits=gather_generation_logits,
-            mapping=self.mapping,
-            max_num_tokens=max_num_tokens,
-            prompt_embedding_table_size=prompt_embedding_table_size,
-            use_lora_plugin=use_lora_plugin,
-            max_draft_len=max_draft_len,
-            lora_target_modules=lora_target_modules)
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
 
-        return (
-            model_inputs['input_ids'],
-            model_inputs['position_ids'],
-            True,
-            model_inputs['last_token_ids'],
-            model_inputs['attention_mask'],
-            KeyValueCacheParams(
-                past_key_value=model_inputs['past_key_value'],
-                host_past_key_value_lengths=model_inputs[
-                    'host_past_key_value_lengths'],
-                host_max_attention_window_sizes=model_inputs[
-                    'host_max_attention_window_sizes'],
-                host_sink_token_length=model_inputs['host_sink_token_length'],
-                kv_cache_block_pointers=model_inputs['kv_cache_block_pointers'],
-                host_kv_cache_block_pointers=model_inputs[
-                    'host_kv_cache_block_pointers'],
-                cache_indirection=model_inputs['cache_indirection'],
-            ),
-            AttentionParams(
-                sequence_length=model_inputs['sequence_length'],
-                context_lengths=model_inputs['context_lengths'],
-                host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types']),
-            model_inputs['prompt_embedding_table'],
-            model_inputs['tasks'],
-            model_inputs['prompt_vocab_size'],
-            LoraParams(
-                model_inputs['lora_ranks'],
-                model_inputs['lora_weights_pointers'],
-                host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types']),
-        )
+        config = GPTConfig.from_hugging_face(hf_config_or_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+
+        if not use_preloading:
+            hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
+            from . import convert
+
+            config = GPTConfig.from_hugging_face(hf_model_dir,
+                                                 dtype=dtype,
+                                                 mapping=mapping,
+                                                 quant_config=quant_config,
+                                                 **kwargs)
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             device=device,
+                             calib_dataset=calib_dataset)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
+
+    @classmethod
+    def from_nemo(cls,
+                  nemo_ckpt_dir: str,
+                  dtype: str = 'auto',
+                  mapping: Optional[Mapping] = None,
+                  quant_config: Optional[QuantConfig] = None,
+                  **kwargs):
+        config = GPTConfig.from_nemo(nemo_ckpt_dir,
+                                     dtype=dtype,
+                                     mapping=mapping,
+                                     quant_config=quant_config,
+                                     **kwargs)
+
+        weights = load_weights_from_nemo(nemo_ckpt_dir, config, **kwargs)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

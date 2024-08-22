@@ -14,12 +14,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "gemmPlugin.h"
+
+#include "gemmPluginProfiler.h"
 #include "plugin.h"
-#include <NvInferRuntimeBase.h>
+#include "pluginUtils.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
+#include "tensorrt_llm/runtime/utils/debugUtils.h"
+
+#include <NvInferRuntime.h>
+
+#include <cassert>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
+using tensorrt_llm::plugins::GemmDims;
 using tensorrt_llm::plugins::GemmPluginCreator;
 using tensorrt_llm::plugins::GemmPlugin;
 using tensorrt_llm::plugins::CublasLtGemmPluginProfiler;
@@ -33,32 +43,36 @@ PluginFieldCollection GemmPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> GemmPluginCreator::mPluginAttributes;
 
 void getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int& m, int& n, int& k, int& lda, int& ldb,
-    int& ldc, bool transA, bool transB, int M, int N, int K)
+    int& ldc, bool transA, bool transB, int M, int N, int K, int padLda, int padLdb)
 {
     transa = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
     transb = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
     m = N;
     n = M;
     k = K;
-    lda = transB ? K : N;
-    ldb = transA ? M : K;
+    lda = transB ? K + padLdb : N + padLdb;
+    ldb = transA ? M + padLda : K + padLda;
     ldc = N;
 }
 
-void runGemm(int const M, int const N, int const K, bool const transA, bool const transB, const nvinfer1::DataType type,
-    CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act, void const* weight, void* output,
+void runGemm(int const M, int const N, int const K, bool const transA, bool const transB, int const padLda,
+    int const padLdb, nvinfer1::DataType const type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act,
+    void const* weight, float const alpha, void* output,
     std::optional<cublasLtMatmulHeuristicResult_t> const& heuristic, void* workspace, cudaStream_t stream)
 {
+    if (M == 0 || N == 0 || K == 0)
+        return;
+
     cublasWrapperPtr->setStream(stream);
     cublasWrapperPtr->setWorkspace(workspace);
 
     cublasOperation_t transa, transb;
     int m, n, k;
     int lda, ldb, ldc;
-    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, transA, transB, M, N, K);
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, transA, transB, M, N, K, padLda, padLdb);
 
     cublasWrapperPtr->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
-    cublasWrapperPtr->Gemm(transa, transb, m, n, k, weight, lda, act, ldb, output, ldc, heuristic);
+    cublasWrapperPtr->Gemm(transa, transb, m, n, k, weight, lda, act, ldb, output, ldc, alpha, 0.0f, heuristic);
     cublasWrapperPtr->destroyDescriptors();
 }
 
@@ -66,7 +80,7 @@ void CublasLtGemmPluginProfiler::runTactic(
     int m, int n, int k, CublasLtGemmPluginProfiler::Config const& tactic, char* workspace, cudaStream_t const& stream)
 {
     size_t dataSize = sizeof(half);
-    if (mType == DataType::kFLOAT)
+    if (mType == nvinfer1::DataType::kFLOAT)
     {
         dataSize = sizeof(float);
     }
@@ -78,7 +92,8 @@ void CublasLtGemmPluginProfiler::runTactic(
         nextWorkspacePtrWithAlignment(reinterpret_cast<int8_t*>(weightPtr), n * k * dataSize, ALIGNMENT));
     char* workspacePtr = reinterpret_cast<char*>(
         nextWorkspacePtrWithAlignment(reinterpret_cast<int8_t*>(outputPtr), m * n * dataSize, ALIGNMENT));
-    runGemm(m, n, k, mTransA, mTransB, mType, mRunner, actPtr, weightPtr, outputPtr, {tactic}, workspacePtr, stream);
+    runGemm(m, n, k, mTransA, mTransB, mPadLda, mPadLdb, mType, mRunner, actPtr, weightPtr, 1.0f, outputPtr, {tactic},
+        workspacePtr, stream);
 }
 
 bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& tactic) const
@@ -86,7 +101,7 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& 
     cublasOperation_t transa, transb;
     int M = m, N = n, K = k;
     int lda, ldb, ldc;
-    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K);
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K, mPadLda, mPadLdb);
 
     mRunner->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
 
@@ -97,7 +112,7 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& 
     return checkResult;
 }
 
-void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void CublasLtGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     size_t dataSize = typeSize(mType);
     size_t outputDataSize = typeSize(mOutputType);
@@ -117,7 +132,7 @@ std::vector<CublasLtGemmPluginProfiler::Config> CublasLtGemmPluginProfiler::getT
     cublasOperation_t transa, transb;
     int m, n, k;
     int lda, ldb, ldc;
-    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K);
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K, mPadLda, mPadLdb);
 
     mRunner->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
     auto const heruistics = mRunner->getTactics(transa, transb, m, n, k, lda, ldb, ldc);
@@ -126,12 +141,15 @@ std::vector<CublasLtGemmPluginProfiler::Config> CublasLtGemmPluginProfiler::getT
     return heruistics;
 }
 
-GemmPlugin::GemmPlugin(
-    int transA, int transB, nvinfer1::DataType type, bool useFp8, GemmPlugin::PluginProfilerPtr const& pluginProfiler)
+GemmPlugin::GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8,
+    float alpha, GemmPlugin::PluginProfilerPtr const& pluginProfiler)
     : mTransA(transA)
     , mTransB(transB)
+    , mPadLda(padLda)
+    , mPadLdb(padLdb)
     , mType(type)
     , mUseFp8(useFp8)
+    , mAlpha(alpha)
     , mPluginProfiler(pluginProfiler)
     , mOutputType(type)
 {
@@ -145,8 +163,11 @@ GemmPlugin::GemmPlugin(void const* data, size_t length, GemmPlugin::PluginProfil
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mTransA);
     read(d, mTransB);
+    read(d, mPadLda);
+    read(d, mPadLdb);
     read(d, mType);
     read(d, mUseFp8);
+    read(d, mAlpha);
     read(d, mDims);
     read(d, mOutputType);
 
@@ -163,28 +184,29 @@ GemmPlugin::GemmPlugin(void const* data, size_t length, GemmPlugin::PluginProfil
 
 void GemmPlugin::init()
 {
-    auto cublasHandle = getCublasHandle();
-    auto cublasLtHandle = getCublasLtHandle();
-    mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    mcublasHandle = getCublasHandle();
+    mcublasLtHandle = getCublasLtHandle();
+    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
     mPluginProfiler->setOutputType(mOutputType);
+    mPluginProfiler->setPadLd(mPadLda, mPadLdb);
 
-    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB);
+    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB, mOutputType);
 }
 
 void GemmPlugin::setGemmConfig()
 {
-    if (mType == DataType::kHALF)
+    if (mType == nvinfer1::DataType::kHALF)
     {
         mCublasWrapper->setFP16GemmConfig(trtToCublasDtype(mOutputType));
     }
-    else if (mType == DataType::kFLOAT)
+    else if (mType == nvinfer1::DataType::kFLOAT)
     {
         mCublasWrapper->setFP32GemmConfig();
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == nvinfer1::DataType::kBF16)
     {
         mCublasWrapper->setBF16GemmConfig(trtToCublasDtype(mOutputType));
     }
@@ -277,62 +299,29 @@ bool GemmPlugin::supportsFormatCombination(
 
     if (pos < nbInputs)
     {
-        return desc.type == mType;
+        // If use FP8, act/weight dtype should be kFP8
+        if (mUseFp8)
+        {
+            return desc.type == nvinfer1::DataType::kFP8;
+        }
+        else
+        {
+            return desc.type == mType;
+        }
     }
 
     return desc.type == mType || desc.type == nvinfer1::DataType::kFLOAT;
 }
 
-int32_t computeMDimension(bool transA, const int32_t nbDims, int32_t const* dims)
-{
-    int32_t M = 1;
-    if (transA)
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            M *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            M *= dims[i];
-        }
-    }
-    return M;
-}
-
-int32_t computeNDimension(bool transB, const int32_t nbDims, int32_t const* dims)
-{
-    int32_t N = 1;
-    if (transB)
-    {
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            N *= dims[i];
-        }
-    }
-    else
-    {
-        for (int i = nbDims - 1; i > 0; --i)
-        {
-            N *= dims[i];
-        }
-    }
-    return N;
-}
-
 void GemmPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
 {
-    int const nbDimsA = in[0].max.nbDims;
-    int const nbDimsB = in[1].max.nbDims;
+    auto const nbDimsA = in[0].max.nbDims;
 
-    auto const minM = computeMDimension(mTransA, nbDimsA, in[0].min.d);
-    auto const maxM = computeMDimension(mTransA, nbDimsA, in[0].max.d);
-    auto const N = computeNDimension(mTransB, nbDimsB, in[1].max.d);
-    auto const K = mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1];
+    auto const minM = utils::computeMDimension(mTransA, in[0].min);
+    auto const maxM = utils::computeMDimension(mTransA, in[0].max);
+    auto const N = utils::computeNDimension(mTransB, in[1].max);
+    auto const K = static_cast<utils::DimType64>(mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1]);
 
     if (!mDims.isInitialized())
     {
@@ -358,18 +347,70 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     //     mat2 [K, N] (mTransB = False)
     // outputs
     //     mat [M, N]
-
+    mcublasHandle = getCublasHandle();
+    mcublasLtHandle = getCublasLtHandle();
+    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
     setGemmConfig();
 
     int const nbDimsA = inputDesc[0].dims.nbDims;
-    int const nbDimsB = inputDesc[1].dims.nbDims;
-    auto const M = computeMDimension(mTransA, nbDimsA, inputDesc[0].dims.d);
-    auto const N = computeNDimension(mTransB, nbDimsB, inputDesc[1].dims.d);
-    int const K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1];
+    int const padM = mTransA ? mPadLda : 0;
+    int const padN = mTransB ? 0 : mPadLdb;
+    int const padK = mTransA ? 0 : mPadLda;
+    auto const M = utils::computeMDimension(mTransA, inputDesc[0].dims) - padM;
+    auto const N = utils::computeNDimension(mTransB, inputDesc[1].dims) - padN;
+    int const K = static_cast<utils::DimType64>(
+        mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK);
 
-    auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
-    runGemm(M, N, K, mTransA, mTransB, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0], bestTactic, workspace,
-        stream);
+    bool noPadDim = padM == 0 && padN == 0 && padK == 0;
+    bool cudaKernelSupportType = mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kFLOAT
+        || mType == nvinfer1::DataType::kBF16;
+
+    // skip computation for a TRT empty tensor
+    if (M == 0)
+    {
+        return 0;
+    }
+
+    std::string mnkStr = "MNK={" + std::to_string(M) + ", " + std::to_string(N) + ", " + std::to_string(K) + "}";
+    {
+        std::string const activationStr = "GEMM layer's activation before GEMM with " + mnkStr;
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasNan(M, K, mType, inputs[0], stream, activationStr) == false,
+            "Found NaN in " + activationStr);
+    }
+
+    bool cudaKernelFinished = false;
+    // TODO: sub tensor matmul is not supported in fp8 gemm cuda kernel
+    if (M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
+    {
+        tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
+        tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
+            nvinfer1::DataType::kFP8, mOutputType);
+        cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
+    }
+    else if (M <= 6 && N <= 128000 && !mUseFp8 && noPadDim && cudaKernelSupportType)
+    {
+        tensorrt_llm::common::QuantMode quantMode;
+        tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
+            mType, mOutputType);
+        cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
+    }
+
+    if (!cudaKernelFinished)
+    {
+        auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
+        runGemm(M, N, K, mTransA, mTransB, mPadLda, mPadLdb, mType, mCublasWrapper, inputs[0], inputs[1], mAlpha,
+            outputs[0], bestTactic, workspace, stream);
+    }
+
+    {
+        std::string const outputStr = "GEMM layer's output after GEMM with " + mnkStr;
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            tensorrt_llm::runtime::utils::tensorHasNan(M, N, mType, outputs[0], stream, outputStr) == false,
+            "Found NaN in " + outputStr);
+    }
     return 0;
 }
 
@@ -378,7 +419,7 @@ nvinfer1::DataType GemmPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
     TLLM_CHECK(index == 0);
-    return inputTypes[0];
+    return mType;
 }
 
 // IPluginV2 Methods
@@ -411,8 +452,9 @@ void GemmPlugin::destroy() noexcept
 
 size_t GemmPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mTransA) + sizeof(mTransB) + sizeof(mType) + sizeof(mDims) + sizeof(mUseFp8)
-        + mPluginProfiler->getSerializationSize(mGemmId) + sizeof(mOutputType); // selected tactics container size
+    return sizeof(mTransA) + sizeof(mTransB) + sizeof(mPadLda) + sizeof(mPadLdb) + sizeof(mType) + sizeof(mDims)
+        + sizeof(mUseFp8) + sizeof(mAlpha) + mPluginProfiler->getSerializationSize(mGemmId)
+        + sizeof(mOutputType); // selected tactics container size
 }
 
 void GemmPlugin::serialize(void* buffer) const noexcept
@@ -420,8 +462,11 @@ void GemmPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mTransA);
     write(d, mTransB);
+    write(d, mPadLda);
+    write(d, mPadLdb);
     write(d, mType);
     write(d, mUseFp8);
+    write(d, mAlpha);
     write(d, mDims);
     write(d, mOutputType);
     mPluginProfiler->serialize(d, mGemmId);
@@ -439,6 +484,8 @@ GemmPluginCreator::GemmPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("padLda", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("padLdb", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
@@ -463,9 +510,10 @@ PluginFieldCollection const* GemmPluginCreator::getFieldNames() noexcept
 IPluginV2* GemmPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int transA, transB;
+    int transA, transB, padLda, padLdb;
     nvinfer1::DataType type;
     int useFp8;
+    float alpha = 1.f;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -480,6 +528,16 @@ IPluginV2* GemmPluginCreator::createPlugin(char const* name, PluginFieldCollecti
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             transB = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "pad_lda"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            padLda = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "pad_ldb"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            padLdb = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
@@ -490,6 +548,11 @@ IPluginV2* GemmPluginCreator::createPlugin(char const* name, PluginFieldCollecti
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             useFp8 = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "alpha"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
+            alpha = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
+        }
     }
     try
     {
@@ -497,7 +560,7 @@ IPluginV2* GemmPluginCreator::createPlugin(char const* name, PluginFieldCollecti
         // Create plugin profiler with shared tactics map
         // FIXME enable tactic profiler
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
-        auto* obj = new GemmPlugin(transA, transB, type, useFp8, pluginProfiler);
+        auto* obj = new GemmPlugin(transA, transB, padLda, padLdb, type, useFp8, alpha, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

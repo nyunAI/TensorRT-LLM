@@ -69,7 +69,7 @@ public:
 protected:
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
 
-    void computeTmpSize(int maxM, int n, int k) override;
+    void computeTmpSize(size_t maxM, size_t n, size_t k) override;
 
     std::vector<Config> getTactics(int m, int n, int k) const override;
 
@@ -129,6 +129,8 @@ private:
     nvinfer1::DataType mType;
     WeightTypeId mWeightTypeId;
     bool mCudaKernelEnabled;
+    tensorrt_llm::kernels::weight_only::KernelType mCudaKernelType;
+    int mArch;
 
     // When M is smaller than this value, we trigger a fast path
     // I.e. a tailored kernel instead of cutlass.

@@ -2,6 +2,20 @@
 
 This document shows how to build and run a Falcon model in TensorRT-LLM on single GPU, single node multi-GPU, and multi-node multi-GPU.
 
+- [Falcon](#falcon)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+    - [4. Run summarization task with the TensorRT engine(s)](#4-run-summarization-task-with-the-tensorrt-engines)
+    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+    - [Groupwise quantization (AWQ)](#groupwise-quantization-awq)
+      - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
+  - [Troubleshooting](#troubleshooting)
+    - [1. The HuggingFace Falcon may raise an error when using  the `accelerate` package.](#1-the-huggingface-falcon-may-raise-an-error-when-using--the-accelerate-package)
+
 ## Overview
 
 The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There is one main file:
@@ -216,9 +230,9 @@ If the engines are run successfully, you will see output like (falcon-rw-1b as t
 
 ### FP8 Post-Training Quantization
 
-The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF Falcon weights and export trtllm checkpoint.
 
@@ -234,7 +248,6 @@ python ../quantization/quantize.py --model_dir ./falcon/180b \
 # Build trtllm engines from the trtllm checkpoint
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1 \
                 --gemm_plugin float16 \
-                --strongly_typed \
                 --output_dir ./falcon/180b/trt_engines/fp8/tp8-pp1 \
                 --workers 8
 
@@ -245,11 +258,13 @@ mpirun -n 8 --allow-run-as-root --oversubscribe \
                 --engine_dir ./falcon/180b/trt_engines/fp8/tp8-pp1
 ```
 
+Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
+
 ### Groupwise quantization (AWQ)
 
-The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF Falcon weights and export trtllm checkpoint.
 
@@ -275,7 +290,7 @@ mpirun -n 2 --allow-run-as-root --oversubscribe \
 ```
 
 #### W4A16 AWQ with FP8 GEMM (W4A8 AWQ)
-For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for AMMO and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
+For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for Modelopt and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
 
 Please make sure your system contains a Hopper GPU before trying the commands below.
 

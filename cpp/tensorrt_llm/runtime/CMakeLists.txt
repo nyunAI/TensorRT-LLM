@@ -19,12 +19,17 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    explicitDraftTokensBuffers.cpp
+    lookaheadBuffers.cpp
+    layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
+    loraCache.cpp
     decodingOutput.cpp
+    generationConfig.cpp
     gptDecoder.cpp
-    gptDecoderBatch.cpp
+    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     gptSession.cpp
     iBuffer.cpp
@@ -36,10 +41,12 @@ set(SRCS
     promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
+    rnnStateBuffers.cpp
     statefulGptDecoder.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp
+    transformerBuffers.cpp
     worldConfig.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
@@ -62,6 +69,6 @@ set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
 endif()

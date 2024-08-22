@@ -16,6 +16,8 @@
  */
 
 #pragma once
+#include <cstdint>
+#include <optional>
 
 namespace tensorrt_llm::common
 {
@@ -23,9 +25,19 @@ namespace tensorrt_llm::common
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 
+// Whether XQA JIT is enabled.
+//
+// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
+std::optional<bool> getEnvEnableXQAJIT();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 
 int getEnvMmhaBlocksPerSequence();
+
+int getEnvMmhaKernelBlockSize();
+
+// Whether FDL is enabled.
+bool getEnvEnableFDL();
 
 } // namespace tensorrt_llm::common

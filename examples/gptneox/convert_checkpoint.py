@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -49,7 +50,7 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
-    parser.add_argument('--ammo_quant_ckpt_path',
+    parser.add_argument('--quant_ckpt_path',
                         type=str,
                         default=None,
                         help='Path of a quantized model checkpoint')
@@ -258,7 +259,8 @@ def load_from_gptq_gptneox(quant_ckpt_path,
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         if not USE_UINT4_INPUT:
@@ -283,7 +285,8 @@ def load_from_gptq_gptneox(quant_ckpt_path,
         GPTQ_FLAG = 1
 
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
 
         # zeros = zeros * scales
         zeros_x_scales_fp16 = (-qzeros_unpacked_int8 + 8 * UINT4_TO_INT4_FLAG -
@@ -665,12 +668,12 @@ if __name__ == '__main__':
     plugin_weight_only_quant_type = None
     if args.use_weight_only and args.weight_only_precision == 'int8':
         plugin_weight_only_quant_type = torch.int8
-        quant_algo = 'W8A16'
+        quant_algo = QuantAlgo.W8A16
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
-        quant_algo = 'W4A16'
+        quant_algo = QuantAlgo.W4A16
     elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-        quant_algo = 'W4A16_GPTQ'
+        quant_algo = QuantAlgo.W4A16_GPTQ
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
@@ -683,7 +686,7 @@ if __name__ == '__main__':
         'num_attention_heads': hf_config.num_attention_heads,
         'hidden_size': hf_config.hidden_size,
         'vocab_size': hf_config.vocab_size,
-        'position_embedding_type': 'learned_absolute',
+        'position_embedding_type': 'rope_gpt_neox',
         'max_position_embeddings': hf_config.max_position_embeddings,
         'rotary_emb_base': hf_config.rotary_emb_base,
         'rotary_pct': hf_config.rotary_pct,
@@ -705,7 +708,7 @@ if __name__ == '__main__':
             'has_zero_point':
             True,
             'group_size':
-            get_gptq_gptneox_group_size(args.ammo_quant_ckpt_path, hf_config)
+            get_gptq_gptneox_group_size(args.quant_ckpt_path, hf_config)
         })
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
@@ -719,7 +722,7 @@ if __name__ == '__main__':
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             weights = load_from_gptq_gptneox(
-                args.ammo_quant_ckpt_path,
+                args.quant_ckpt_path,
                 hf_config,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,

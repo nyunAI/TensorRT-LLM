@@ -35,7 +35,7 @@ public:
     static at::Tensor tensor(ITensor::SharedPtr tensor)
     {
         auto const tensorOptions = at::device(TorchUtils::device((*tensor).data()))
-                                       .pinned_memory((*tensor).getMemoryType() == MemoryType::kPINNED)
+                                       .pinned_memory((*tensor).getMemoryType() == MemoryType::kPINNEDPOOL)
                                        .dtype(TorchUtils::dataType((*tensor).getDataType()))
                                        .layout(at::kStrided);
         return at::for_blob(tensor->data(), TorchUtils::shape(tensor->getShape())) // NOLINT(*-use-after-move)
@@ -58,7 +58,7 @@ public:
 
     static at::Tensor buffer(IBuffer::SharedPtr buffer)
     {
-        auto const shape = ITensor::makeShape({static_cast<runtime::SizeType>(buffer->getSize())});
+        auto const shape = ITensor::makeShape({static_cast<runtime::SizeType32>(buffer->getSize())});
         return tensor(ITensor::view(std::move(buffer), shape));
     }
 

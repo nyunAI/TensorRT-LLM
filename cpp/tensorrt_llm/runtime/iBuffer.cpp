@@ -34,7 +34,7 @@ MemoryType IBuffer::memoryType(void const* data)
     TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, data));
     switch (attributes.type)
     {
-    case cudaMemoryTypeHost: return MemoryType::kPINNED;
+    case cudaMemoryTypeHost: return MemoryType::kPINNEDPOOL;
     case cudaMemoryTypeDevice: return MemoryType::kGPU;
     case cudaMemoryTypeManaged: return MemoryType::kUVM;
     case cudaMemoryTypeUnregistered: return MemoryType::kCPU;
@@ -61,6 +61,10 @@ IBuffer::UniquePtr IBuffer::wrap(void* data, nvinfer1::DataType type, std::size_
         result.reset(new GenericBuffer<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
         break;
+    case MemoryType::kPINNEDPOOL:
+        result.reset(new GenericBuffer<PinnedPoolBorrowingAllocator>( // NOLINT(modernize-make-unique)
+            capacity, type, PinnedPoolBorrowingAllocator(data, capacityInBytes)));
+        break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
             new GenericBuffer<CpuBorrowingAllocator>(capacity, type, CpuBorrowingAllocator(data, capacityInBytes)));
@@ -79,7 +83,7 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& output, IBuffer co
 {
     auto data = const_cast<IBuffer&>(buffer).data();
     auto tensor = ITensor::wrap(data, buffer.getDataType(),
-        ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
+        ITensor::makeShape({static_cast<SizeType32>(buffer.getSize())}), buffer.getCapacity());
     return output << *tensor;
 }
 
@@ -96,6 +100,7 @@ char const* IBuffer::getDataTypeName() const
     case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
     case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
     case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
+    case nvinfer1::DataType::kINT4: /* do nothing */;
     }
     TLLM_THROW("Unknown data type");
 }
@@ -105,6 +110,7 @@ char const* IBuffer::getMemoryTypeName() const
     switch (getMemoryType())
     {
     case MemoryType::kPINNED: return MemoryTypeString<MemoryType::kPINNED>::value;
+    case MemoryType::kPINNEDPOOL: return MemoryTypeString<MemoryType::kPINNEDPOOL>::value;
     case MemoryType::kCPU: return MemoryTypeString<MemoryType::kCPU>::value;
     case MemoryType::kGPU: return MemoryTypeString<MemoryType::kGPU>::value;
     case MemoryType::kUVM: return MemoryTypeString<MemoryType::kUVM>::value;

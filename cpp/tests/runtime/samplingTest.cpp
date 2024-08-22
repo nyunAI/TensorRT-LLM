@@ -19,17 +19,19 @@
 
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 namespace tl = tensorrt_llm::layers;
+namespace tle = tensorrt_llm::executor;
 
 class SamplingTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -50,12 +52,15 @@ protected:
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
 };
 
-typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferManager& manager,
-    std::shared_ptr<tc::CudaAllocator> allocator, size_t vocabSize, size_t vocabSizePadded, size_t batchSize,
-    size_t beamWidth, int step, int ite, int maxInputLength, size_t maxSeqLength, size_t sinkTokenLength,
-    int localBatchSize, std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
+std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<BufferManager> manager, size_t vocabSize,
+    size_t vocabSizePadded, size_t batchSize, size_t beamWidth, int step, int ite, int maxInputLength,
+    size_t maxSeqLength, size_t sinkTokenLength, int localBatchSize, std::vector<int>& cpuOutputIds,
+    std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
 {
     constexpr int endId = 1;
+    auto signedBatchSize = static_cast<int32_t>(batchSize);
+    auto signedBeamWidth = static_cast<int32_t>(beamWidth);
+    auto signedMaxSeqLength = static_cast<int32_t>(maxSeqLength);
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
@@ -63,53 +68,47 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     std::vector<int> cpuSequenceLengths(batchSize, maxInputLength);
     std::vector<int> cpuNoRepeatNgramSize(batchSize, noRepeatNgramSizeValue);
 
-    float* gpuLogits = nullptr;
-    int* gpuEndIds = nullptr;
-    int* gpuOutputIds = nullptr;
-    int* gpuSequenceLengths = nullptr;
-    int* gpuNewTokens = nullptr;
-    int* gpuNoRepeatNgramSize = nullptr;
+    tk::FinishedState::UnderlyingType* gpuFinished = nullptr;
 
-    gpuLogits = allocator->reMalloc(gpuLogits, batchSize * beamWidth * vocabSizePadded * sizeof(float));
-    gpuEndIds = allocator->reMalloc(gpuEndIds, batchSize * sizeof(int));
-    gpuOutputIds = allocator->reMalloc(gpuOutputIds, batchSize * beamWidth * maxSeqLength * sizeof(int));
-    gpuSequenceLengths = allocator->reMalloc(gpuSequenceLengths, batchSize * sizeof(int));
-    gpuNewTokens = allocator->reMalloc(gpuNewTokens, batchSize * beamWidth * sizeof(int));
-    gpuNoRepeatNgramSize = allocator->reMalloc(gpuNoRepeatNgramSize, batchSize * sizeof(int));
+    ITensor::SharedPtr gpuEndIds = manager->gpu(ITensor::makeShape({signedBatchSize}), nvinfer1::DataType::kINT32);
+    manager->copy(cpuEndIds.data(), *gpuEndIds, MemoryType::kCPU);
+    ITensor::SharedPtr gpuOutputIds = manager->gpu(
+        ITensor::makeShape({signedBatchSize, signedBeamWidth, signedMaxSeqLength}), nvinfer1::DataType::kINT32);
+    manager->copy(cpuOutputIds.data(), *gpuOutputIds, MemoryType::kCPU);
 
-    cudaMemcpy(gpuLogits, cpuLogits.data(), cpuLogits.size() * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpuEndIds, cpuEndIds.data(), cpuEndIds.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(
-        gpuSequenceLengths, cpuSequenceLengths.data(), cpuSequenceLengths.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpuOutputIds, cpuOutputIds.data(), cpuOutputIds.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpuNoRepeatNgramSize, cpuNoRepeatNgramSize.data(), cpuNoRepeatNgramSize.size() * sizeof(int),
-        cudaMemcpyHostToDevice);
+    auto const decodingMode = beamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
+    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(batchSize, beamWidth, vocabSize, vocabSizePadded);
+    auto ddLayer = tl::DynamicDecodeLayer<float>(decodingMode, decodingDomain, manager);
 
-    tc::Tensor logits{tc::MEMORY_GPU, tc::TYPE_FP32, {batchSize, beamWidth, vocabSizePadded}, gpuLogits};
-    tc::Tensor endIds{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuEndIds};
-    tc::Tensor outputIds{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize, beamWidth, maxSeqLength}, gpuOutputIds};
-    tc::Tensor sequenceLengths{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuSequenceLengths};
-    tc::Tensor newTokens{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNewTokens};
-    tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
+    auto setupParams = std::make_shared<tl::DynamicDecodeSetupParams>();
+    setupParams->banWordsParams = std::make_shared<tl::BanWordsSetupParams>();
+    setupParams->banWordsParams->noRepeatNgramSize = cpuNoRepeatNgramSize;
 
-    auto const decodingMode = beamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
-    auto ddLayer = tl::DynamicDecodeLayer<float>(
-        decodingMode, batchSize, beamWidth, vocabSize, vocabSizePadded, manager.getStream().get(), allocator, &prop);
+    setupParams->penaltyParams = std::make_shared<tl::PenaltySetupParams>();
+    setupParams->decodingParams = std::make_shared<tl::SamplingSetupParams>();
 
-    typename tl::DynamicDecodeLayer<float>::SetupParams setupParams;
+    auto batchSlots = getDefaultBatchSlots(batchSize, *manager);
+    ddLayer.setup(batchSize, beamWidth, batchSlots, setupParams);
 
-    ddLayer.setup(batchSize, beamWidth, nullptr, setupParams);
+    auto forwardParams = std::make_shared<tl::SamplingInputs>(gpuEndIds, batchSlots, step, ite, localBatchSize);
+    auto logitsShape
+        = ITensor::makeShape({signedBatchSize, static_cast<int64_t>(beamWidth), static_cast<int64_t>(vocabSizePadded)});
+    forwardParams->logits = manager->gpu(logitsShape, nvinfer1::DataType::kFLOAT);
+    manager->copy(cpuLogits.data(), *forwardParams->logits.value(), MemoryType::kCPU);
 
-    typename tl::DynamicDecodeLayer<float>::ForwardParams forwardParams(
-        step, ite, maxInputLength, static_cast<int>(maxSeqLength), sinkTokenLength, localBatchSize, endIds);
-    forwardParams.logits = logits;
-    forwardParams.no_repeat_ngram_size = noRepeatNgramSize;
+    forwardParams->banWordsInputs = std::make_shared<tl::BanWordsDecodingInputs>(localBatchSize);
 
-    typename tl::DynamicDecodeLayer<float>::OutputParams outputParams(outputIds);
-    outputParams.sequence_length = sequenceLengths;
-    outputParams.newTokens = newTokens;
+    forwardParams->stopCriteriaInputs = std::make_shared<tl::StopCriteriaDecodingInputs>(localBatchSize);
 
-    ddLayer.forward(outputParams, forwardParams);
+    auto outputParams = std::make_shared<tl::BaseDecodingOutputs>(gpuOutputIds);
+    outputParams->sequenceLength = manager->gpu(ITensor::makeShape({signedBatchSize}), nvinfer1::DataType::kINT32);
+    manager->copy(cpuSequenceLengths.data(), *outputParams->sequenceLength.value(), MemoryType::kCPU);
+    outputParams->newTokens
+        = manager->gpu(ITensor::makeShape({signedBatchSize, signedBeamWidth}), nvinfer1::DataType::kINT32);
+    outputParams->finished = manager->gpu(
+        ITensor::makeShape({signedBatchSize, signedBeamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+
+    ddLayer.forwardAsync(outputParams, forwardParams);
 
     return outputParams;
 }
@@ -117,8 +116,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
 TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
 {
     auto streamPtr = std::make_shared<CudaStream>();
-    BufferManager manager(streamPtr);
-    auto allocator = std::make_shared<tc::CudaAllocator>(manager);
+    auto manager = std::make_shared<BufferManager>(streamPtr);
 
     constexpr size_t vocabSize{200};
     constexpr size_t vocabSizePadded{256};
@@ -145,11 +143,9 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     cpuLogits[42] = 10.0;
     cpuLogits[43] = 5.0;
 
-    auto outputParams = dynamicDecodeTest(manager, allocator, vocabSize, vocabSizePadded, batchSize, beamWidth, step,
-        ite, maxInputLength, maxSeqLength, sinkTokenLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
+    auto outputParams = dynamicDecodeTest(manager, vocabSize, vocabSizePadded, batchSize, beamWidth, step, ite,
+        maxInputLength, maxSeqLength, sinkTokenLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
 
-    cudaMemcpy(cpuOutputIds.data(), outputParams.output_ids.getPtr<int>(), cpuOutputIds.size() * sizeof(int),
-        cudaMemcpyDeviceToHost);
-
+    manager->copy(*outputParams->outputIds, cpuOutputIds.data(), MemoryType::kCPU);
     EXPECT_EQ(cpuOutputIds[maxSeqLength - 1], 43);
 }

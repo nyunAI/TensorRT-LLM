@@ -27,7 +27,8 @@ import tensorrt_llm
 import tensorrt_llm as tllm
 from tensorrt_llm import Tensor, net_guard
 from tensorrt_llm._utils import torch_to_numpy
-from tensorrt_llm.functional import PositionEmbeddingType, gpt_attention
+from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
+                                     gpt_attention)
 from tensorrt_llm.graph_rewriting import (AnalysisPatternManager,
                                           FLayerInfoMemo,
                                           FuseAttentionWithBiasPass, Layer,
@@ -56,7 +57,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         net.plugin_config.to_legacy_setting()
-        net.plugin_config.set_gpt_attention_plugin(dtype)
+        net.plugin_config.gpt_attention_plugin = dtype
         net.plugin_config.remove_input_padding = True
 
         head_size = hidden_size // num_heads
@@ -126,6 +127,16 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 position_embedding_type = PositionEmbeddingType.rope_gptj
             else:
                 position_embedding_type = PositionEmbeddingType.learned_absolute
+            rotary_inv_freq_cache, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                1024, rotary_embedding_dim)
+            if position_embedding_type.is_rope():
+                rotary_inv_freq = tensorrt_llm.functional.constant(
+                    rotary_inv_freq_cache)
+                rotary_cos_sin = tensorrt_llm.functional.constant(
+                    embed_positions_for_gpt_attention)
+            else:
+                rotary_inv_freq = None
+                rotary_cos_sin = None
             outputs = tensorrt_llm.functional.gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value_tensor,
@@ -145,11 +156,13 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 max_context_length=in_len,
                 rotary_embedding_dim=rotary_embedding_dim,
                 position_embedding_type=position_embedding_type,
+                rotary_inv_freq=rotary_inv_freq,
+                rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=None,
                 kv_quant_orig_scale=None,
                 kv_cache_quant_mode=QuantMode.from_description(
                     use_int8_kv_cache=False),
-                kv_cache_block_pointers=None,
+                kv_cache_block_offsets=None,
                 host_context_lengths=host_context_lengths_tensor)
 
             net._mark_output(outputs[0],
