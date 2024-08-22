@@ -46,7 +46,7 @@ def get_calib_dataloader(
     else:
         dataset = kompress_dataset.load_caliberation_data()
         logger.info(f"✅ Loading Kompress dataset complete.")
-
+    dataset = dataset[:calib_size]
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",
                                   padding=True,

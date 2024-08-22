@@ -193,7 +193,8 @@ def get_calib_dataloader(data="cnn_dailymail",
         dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
     else:
         dataset = kompress_dataset.load_caliberation_data()
-
+        logger.info(f"✅ Loading Kompress dataset complete.")
+    dataset = dataset[:calib_size]
     batch_encoded = tokenizer.batch_encode_plus(dataset,
                                                 return_tensors="pt",
                                                 padding=True,
